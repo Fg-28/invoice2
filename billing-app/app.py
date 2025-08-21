@@ -7,13 +7,15 @@
 # - Invoice: GST @ env GST_TOTAL (default 5%), global SAC, logs to "Invoice"
 # - Firms from "ID" tab, Suppliers from "Supplier" tab
 #
-# pip install: flask gspread google-auth reportlab gunicorn
+# pip install: flask gspread google-auth reportlab gunicorn requests
 
 import os, re, io, json, base64
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from functools import wraps
+from urllib.parse import urlparse, parse_qs, urljoin
 
+import requests
 from flask import (
     Flask, render_template, request, redirect, url_for,
     session, send_file, flash
@@ -270,8 +272,7 @@ def append_row_to_challan(row_dict):
             k = (key or "").strip().lower()
             if not k: continue
             if k == "invoice_mtr":
-                # never set here
-                continue
+                continue  # never set at challan creation
             if k in idx_lower:
                 row[idx_lower[k]] = val
 
@@ -389,16 +390,106 @@ def _num_words(n):
 
 def _rupees_words(v):  return f"{_num_words(int(round(v)))} Rupees Only"
 
+# --------- Image helpers (robust share-link resolver) ---------
+_UA_HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Safari/537.36"}
+def _fix_share_url(u: str) -> str:
+    """Normalize common share links to direct image content when possible."""
+    try:
+        if not u: return u
+        u = u.strip()
+        p = urlparse(u)
+
+        # Dropbox: add raw=1
+        if "dropbox.com" in p.netloc and "raw=1" not in u:
+            if "dl=0" in u: u = u.replace("dl=0","raw=1")
+            elif "dl=1" in u: u = u.replace("dl=1","raw=1")
+            elif "www.dropbox.com" in u and "?raw=1" not in u:
+                u = u + ("&raw=1" if "?" in u else "?raw=1")
+            return u
+
+        # Google Drive: convert to uc?export=download&id=...
+        if "drive.google.com" in p.netloc:
+            # patterns: /file/d/<id>/view, or open?id=<id>
+            m = re.search(r"/file/d/([^/]+)/", p.path)
+            if m:
+                fid = m.group(1)
+                return f"https://drive.google.com/uc?export=download&id={fid}"
+            qs = parse_qs(p.query or "")
+            fid = (qs.get("id") or [None])[0]
+            if fid:
+                return f"https://drive.google.com/uc?export=download&id={fid}"
+            return u
+
+        # ibb.co share page -> we'll fetch and read og:image later
+        return u
+    except Exception:
+        return u
+
+def _http_get(url: str, expect_image=False, timeout=10):
+    try:
+        resp = requests.get(url, headers=_UA_HEADERS, timeout=timeout, allow_redirects=True)
+        ct = (resp.headers.get("Content-Type") or "").lower()
+        if expect_image and ("image/" not in ct):
+            # not an image -> treat as failure for this branch
+            return None
+        return resp
+    except Exception as e:
+        print("HTTP fetch failed:", e)
+        return None
+
+def _extract_og_image(html: str, base_url: str) -> str | None:
+    try:
+        # simple regex for: <meta property="og:image" content="...">
+        m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html, flags=re.I)
+        if not m:
+            m = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', html, flags=re.I)
+        if not m: return None
+        link = m.group(1).strip()
+        return urljoin(base_url, link)
+    except Exception:
+        return None
+
 def _image_reader_from_src(src):
-    """Support http(s) URL, file path, or data URI (base64)."""
+    """Support http(s) URL, share-page resolution, file path, or data URI (base64)."""
     if not src: return None
     src = src.strip()
     try:
+        # Data URI
         if src.startswith("data:image/"):
             header, b64 = src.split(",", 1)
             data = base64.b64decode(b64)
             return ImageReader(io.BytesIO(data))
-        # http(s) URL or local path
+
+        # Local file path
+        if os.path.exists(src):
+            with open(src, "rb") as f:
+                return ImageReader(io.BytesIO(f.read()))
+
+        # HTTP(S)
+        if src.startswith("http://") or src.startswith("https://"):
+            url = _fix_share_url(src)
+
+            # First try: fetch as image
+            r = _http_get(url, expect_image=True)
+            if r and r.ok and (r.headers.get("Content-Type","").lower().startswith("image/")):
+                return ImageReader(io.BytesIO(r.content))
+
+            # If not an image, try to resolve og:image (for ibb.co & generic pages)
+            r2 = _http_get(url, expect_image=False)
+            if r2 and r2.ok and r2.text:
+                og = _extract_og_image(r2.text, url)
+                if og:
+                    r3 = _http_get(og, expect_image=True)
+                    if r3 and r3.ok and r3.headers.get("Content-Type","").lower().startswith("image/"):
+                        return ImageReader(io.BytesIO(r3.content))
+
+            # Last resort: let reportlab try URL directly (may or may not work)
+            try:
+                return ImageReader(url)
+            except Exception:
+                pass
+
+        # Fallback: direct
         return ImageReader(src)
     except Exception as e:
         print("Logo load skipped:", e)
@@ -410,7 +501,9 @@ def _draw_logo(c, logo_src, x_right, y_top, max_w, max_h):
         img = _image_reader_from_src(logo_src)
         if not img: return
         iw, ih = img.getSize()
+        if iw <= 0 or ih <= 0: return
         scale = min(max_w/iw, max_h/ih)
+        if scale <= 0: return
         w = iw * scale
         h = ih * scale
         c.drawImage(img, x_right - w, y_top - h, w, h, preserveAspectRatio=True, mask='auto')
@@ -1109,9 +1202,9 @@ function addFromChallan(){
     if(r['Rate'] !== undefined && r['Rate'] !== null && r['Rate'] !== ''){
       rate = String(r['Rate']);
     }else{
-      const amt = safeNum(r['Amount']);
+      const amt = safeNum(r['Amount'] || r['Taxable_Amount']);
       const qn  = safeNum(qtyRaw);
-      if(qn > 0) rate = (amt / qn).toFixed(2);
+      if(qn > 0 && amt) rate = (amt / qn).toFixed(2);
     }
     addRow({ ch: chSel, desc: desc, qty: qty, rate: rate });
     current++;
@@ -1250,7 +1343,7 @@ def challan():
     )
     data = buf.getvalue()
 
-    # Log rows to "Challan" (NAME-BASED)
+    # Log rows to "Challan" (NAME-BASED) — also write Rate if the sheet has it
     created = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
     for d, q, r, a in items:
         row_dict = {
@@ -1264,6 +1357,7 @@ def challan():
             "Gst_No":                  party["gstin"],
             "Description":             d,
             "Qty":                     f"{q:.2f}",
+            "Rate":                    f"{r:.2f}",   # <- populate if column exists
             "Amount":                  f"{a:.2f}",
             "Taxable_Amount":          f"{a:.2f}",
             # NOTE: INVOICE_MTR intentionally NOT set here
@@ -1287,7 +1381,7 @@ def invoice():
     firm_keys = list(firms.keys())
     if request.method == "GET":
         return render_template("invoice.html",
-                               firms=firms, suppliers=suppliers, challans=challlans if False else challans,
+                               firms=firms, suppliers=suppliers, challans=challans,
                                next_no=get_next_invoice_number(),
                                today=datetime.now(IST).strftime("%d/%m/%Y"),
                                sac_default=SAC_DEFAULT,
