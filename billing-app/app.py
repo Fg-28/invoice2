@@ -36,11 +36,11 @@ SPREADSHEET_ID   = os.getenv("SPREADSHEET_ID")        # required
 GOOGLE_SA_JSON   = os.getenv("GOOGLE_SA_JSON")        # service account JSON (single env var)
 SESSION_SECRET   = os.getenv("SESSION_SECRET", "change-me")
 
-# --- NEW: local logo directory & Windows default save dir ---
+# Local logo directory (relative to app root by default; normalized to absolute after app is created)
 LOGO_DIR = os.getenv("LOGO_DIR", os.path.join("invoice2", "billing-app", "static", "logos"))
 
 # Optional: where to save a server-side copy (works if path exists & writable)
-SAVE_DIR         = os.getenv("SAVE_DIR", "").strip()
+SAVE_DIR = os.getenv("SAVE_DIR", "").strip()
 if not SAVE_DIR and os.name == "nt":
     SAVE_DIR = r"C:\Invoice_Challan"
 
@@ -65,6 +65,10 @@ app = Flask(__name__)
 app.secret_key = SESSION_SECRET
 app.permanent_session_lifetime = timedelta(days=30)  # "remember me"
 
+# Normalize LOGO_DIR to an absolute path (so we don't depend on current working dir)
+if not os.path.isabs(LOGO_DIR):
+    LOGO_DIR = os.path.normpath(os.path.join(app.root_path, LOGO_DIR))
+
 # ==============================
 # Small helpers
 # ==============================
@@ -77,17 +81,13 @@ def _firm_dir_name(name: str) -> str:
     return re.sub(r'\s+', '_', (name or '').strip())
 
 def _local_logo_path(company_name: str) -> str | None:
-    # Prefer .jpeg (per your convention), gracefully fall back to .jpg/.png if present
+    # Only return an existing file; prefer .jpeg, accept .jpg/.png/.webp
     slug = _slug_lower(company_name)
-    preferred = os.path.join(LOGO_DIR, slug + ".jpeg")
-    if os.path.exists(preferred):
-        return preferred
-    for ext in (".jpg", ".png"):
+    for ext in (".jpeg", ".jpg", ".png", ".webp"):
         p = os.path.join(LOGO_DIR, slug + ext)
         if os.path.exists(p):
             return p
-    # Return the expected .jpeg path anyway (you can drop the file later)
-    return preferred
+    return None
 
 # ==============================
 # Google Sheets helpers
@@ -124,7 +124,7 @@ def load_firms():
                 "addr": val(r,"address"),
                 "mobile": val(r,"number"),
                 "gst": val(r,"gst"),
-                # always prefer local static logo (lowercase + underscores + .jpeg)
+                # always prefer local static logo (lowercase + underscores + .jpeg/.jpg/.png/.webp)
                 "logo": _local_logo_path(firm),
                 "bank_lines": [
                     f"Bank: {val(r,'bank') or '—'}",
@@ -420,23 +420,30 @@ def _num_words(n):
 def _rupees_words(v):  return f"{_num_words(int(round(v)))} Rupees Only"
 
 def _image_reader_from_src(src):
-    """Support local file path or data URI (base64)."""
-    if not src: return None
+    """Support local file path or data URI (base64). Skip cleanly if missing."""
+    if not src:
+        return None
     src = src.strip()
     try:
-        # Data URI
         if src.startswith("data:image/"):
             header, b64 = src.split(",", 1)
             data = base64.b64decode(b64)
             return ImageReader(io.BytesIO(data))
 
-        # Local file path
+        # If it's a path, ensure it exists (absolute or relative to app.root_path)
         if os.path.exists(src):
             with open(src, "rb") as f:
                 return ImageReader(io.BytesIO(f.read()))
 
-        # Fallback: let reportlab try path (may or may not work)
-        return ImageReader(src)
+        if not os.path.isabs(src):
+            abs_candidate = os.path.join(app.root_path, src)
+            if os.path.exists(abs_candidate):
+                with open(abs_candidate, "rb") as f:
+                    return ImageReader(io.BytesIO(f.read()))
+
+        # Missing -> skip quietly
+        return None
+
     except Exception as e:
         print("Logo load skipped:", e)
         return None
