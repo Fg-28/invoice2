@@ -1,21 +1,19 @@
 # single-file web app: Challan + Invoice (Flask) with Google Sheets + PDF
 # - Deployable on Railway (or any host)
 # - Secrets via ENV: SPREADSHEET_ID, GOOGLE_SA_JSON, SESSION_SECRET
-# - Optional ENV: SAVE_DIR (local folder to save server-side copies; e.g. C:\Invoice_challan)
+# - Optional ENV: SAVE_DIR (local folder to save server-side copies; default on Windows is C:\Invoice_Challan)
 # - Login reads ID/PASS from Google Sheet tab "PASS" (A2=id, B2=pass)
-# - Challan: 2 copies per page, 5 rows, no GST/discount, logs to "Challan"
+# - Challan: 2 copies per page, 5 rows, logs to "Challan"
 # - Invoice: GST @ env GST_TOTAL (default 5%), global SAC, logs to "Invoice"
 # - Firms from "ID" tab, Suppliers from "Supplier" tab
 #
-# pip install: flask gspread google-auth reportlab gunicorn requests
+# pip install: flask gspread google-auth reportlab gunicorn
 
 import os, re, io, json, base64
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from functools import wraps
-from urllib.parse import urlparse, parse_qs, urljoin
 
-import requests
 from flask import (
     Flask, render_template, request, redirect, url_for,
     session, send_file, flash
@@ -38,8 +36,13 @@ SPREADSHEET_ID   = os.getenv("SPREADSHEET_ID")        # required
 GOOGLE_SA_JSON   = os.getenv("GOOGLE_SA_JSON")        # service account JSON (single env var)
 SESSION_SECRET   = os.getenv("SESSION_SECRET", "change-me")
 
+# --- NEW: local logo directory & Windows default save dir ---
+LOGO_DIR = os.getenv("LOGO_DIR", os.path.join("invoice2", "billing-app", "static", "logos"))
+
 # Optional: where to save a server-side copy (works if path exists & writable)
-SAVE_DIR         = os.getenv("SAVE_DIR", "").strip()  # e.g. C:\Invoice_challan
+SAVE_DIR         = os.getenv("SAVE_DIR", "").strip()
+if not SAVE_DIR and os.name == "nt":
+    SAVE_DIR = r"C:\Invoice_Challan"
 
 # Sheet names
 ID_TAB_NAME        = os.getenv("ID_TAB_NAME", "ID")
@@ -63,6 +66,30 @@ app.secret_key = SESSION_SECRET
 app.permanent_session_lifetime = timedelta(days=30)  # "remember me"
 
 # ==============================
+# Small helpers
+# ==============================
+def _slug_lower(name: str) -> str:
+    # lowercased, spaces & non-alnum to _
+    return re.sub(r'[^a-z0-9]+', '_', (name or '').lower()).strip('_')
+
+def _firm_dir_name(name: str) -> str:
+    # Firm folder name: keep case, spaces -> underscores
+    return re.sub(r'\s+', '_', (name or '').strip())
+
+def _local_logo_path(company_name: str) -> str | None:
+    # Prefer .jpeg (per your convention), gracefully fall back to .jpg/.png if present
+    slug = _slug_lower(company_name)
+    preferred = os.path.join(LOGO_DIR, slug + ".jpeg")
+    if os.path.exists(preferred):
+        return preferred
+    for ext in (".jpg", ".png"):
+        p = os.path.join(LOGO_DIR, slug + ext)
+        if os.path.exists(p):
+            return p
+    # Return the expected .jpeg path anyway (you can drop the file later)
+    return preferred
+
+# ==============================
 # Google Sheets helpers
 # ==============================
 def _gc():
@@ -77,7 +104,7 @@ def _ws(sheet_name):
     return gc.open_by_key(SPREADSHEET_ID).worksheet(sheet_name)
 
 def load_firms():
-    """Return dict: key -> profile dict (includes 'logo' from 'logolink')."""
+    """Return dict: key -> profile dict (logo loaded from local LOGO_DIR)."""
     try:
         ws = _ws(ID_TAB_NAME)
         rows = ws.get_all_values()
@@ -97,7 +124,8 @@ def load_firms():
                 "addr": val(r,"address"),
                 "mobile": val(r,"number"),
                 "gst": val(r,"gst"),
-                "logo": val(r,"logolink"),  # <-- logo URL/path/data-URI
+                # always prefer local static logo (lowercase + underscores + .jpeg)
+                "logo": _local_logo_path(firm),
                 "bank_lines": [
                     f"Bank: {val(r,'bank') or '—'}",
                     f"A/C Name: {val(r,'account_name') or '—'}",
@@ -130,7 +158,7 @@ def load_suppliers():
 
 # ---------- Header normalizer for Challan rows (for Invoice import UI) ----------
 CANON_KEYS = [
-    "Firm","Supplier Code","Challan_Number","INVOICE_MTR","Description","Qty","MTR","Rate","Amount"
+    "Firm","Supplier Code","Challan_Number","INVOICE_MTR","Description","Qty","MTR","Rate","Amount","Taxable_Amount"
 ]
 def _norm_key(s): return re.sub(r"[^a-z0-9]+","", (s or "").lower())
 
@@ -145,6 +173,7 @@ KEY_SYNONYMS = {
     "MTR": ["mtr","meter","metre","meters","qty"],  # fallback mirror
     "Rate": ["rate","price","per","perunit","per_mtr"],
     "Amount": ["amount","amt","total","subtotal","grandtotal"],
+    "Taxable_Amount": ["taxable_amount","taxableamount","line_total","linetotal","totalamount"]
 }
 
 def load_challan_rows():
@@ -390,67 +419,8 @@ def _num_words(n):
 
 def _rupees_words(v):  return f"{_num_words(int(round(v)))} Rupees Only"
 
-# --------- Image helpers (robust share-link resolver) ---------
-_UA_HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Safari/537.36"}
-def _fix_share_url(u: str) -> str:
-    """Normalize common share links to direct image content when possible."""
-    try:
-        if not u: return u
-        u = u.strip()
-        p = urlparse(u)
-
-        # Dropbox: add raw=1
-        if "dropbox.com" in p.netloc and "raw=1" not in u:
-            if "dl=0" in u: u = u.replace("dl=0","raw=1")
-            elif "dl=1" in u: u = u.replace("dl=1","raw=1")
-            elif "www.dropbox.com" in u and "?raw=1" not in u:
-                u = u + ("&raw=1" if "?" in u else "?raw=1")
-            return u
-
-        # Google Drive: convert to uc?export=download&id=...
-        if "drive.google.com" in p.netloc:
-            # patterns: /file/d/<id>/view, or open?id=<id>
-            m = re.search(r"/file/d/([^/]+)/", p.path)
-            if m:
-                fid = m.group(1)
-                return f"https://drive.google.com/uc?export=download&id={fid}"
-            qs = parse_qs(p.query or "")
-            fid = (qs.get("id") or [None])[0]
-            if fid:
-                return f"https://drive.google.com/uc?export=download&id={fid}"
-            return u
-
-        # ibb.co share page -> we'll fetch and read og:image later
-        return u
-    except Exception:
-        return u
-
-def _http_get(url: str, expect_image=False, timeout=10):
-    try:
-        resp = requests.get(url, headers=_UA_HEADERS, timeout=timeout, allow_redirects=True)
-        ct = (resp.headers.get("Content-Type") or "").lower()
-        if expect_image and ("image/" not in ct):
-            # not an image -> treat as failure for this branch
-            return None
-        return resp
-    except Exception as e:
-        print("HTTP fetch failed:", e)
-        return None
-
-def _extract_og_image(html: str, base_url: str) -> str | None:
-    try:
-        # simple regex for: <meta property="og:image" content="...">
-        m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html, flags=re.I)
-        if not m:
-            m = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', html, flags=re.I)
-        if not m: return None
-        link = m.group(1).strip()
-        return urljoin(base_url, link)
-    except Exception:
-        return None
-
 def _image_reader_from_src(src):
-    """Support http(s) URL, share-page resolution, file path, or data URI (base64)."""
+    """Support local file path or data URI (base64)."""
     if not src: return None
     src = src.strip()
     try:
@@ -465,31 +435,7 @@ def _image_reader_from_src(src):
             with open(src, "rb") as f:
                 return ImageReader(io.BytesIO(f.read()))
 
-        # HTTP(S)
-        if src.startswith("http://") or src.startswith("https://"):
-            url = _fix_share_url(src)
-
-            # First try: fetch as image
-            r = _http_get(url, expect_image=True)
-            if r and r.ok and (r.headers.get("Content-Type","").lower().startswith("image/")):
-                return ImageReader(io.BytesIO(r.content))
-
-            # If not an image, try to resolve og:image (for ibb.co & generic pages)
-            r2 = _http_get(url, expect_image=False)
-            if r2 and r2.ok and r2.text:
-                og = _extract_og_image(r2.text, url)
-                if og:
-                    r3 = _http_get(og, expect_image=True)
-                    if r3 and r3.ok and r3.headers.get("Content-Type","").lower().startswith("image/"):
-                        return ImageReader(io.BytesIO(r3.content))
-
-            # Last resort: let reportlab try URL directly (may or may not work)
-            try:
-                return ImageReader(url)
-            except Exception:
-                pass
-
-        # Fallback: direct
+        # Fallback: let reportlab try path (may or may not work)
         return ImageReader(src)
     except Exception as e:
         print("Logo load skipped:", e)
@@ -519,7 +465,7 @@ def _save_copy(kind, firm_name, filename, data_bytes):
     try:
         if not SAVE_DIR: return
         base = os.path.abspath(SAVE_DIR)
-        sub  = os.path.join(base, kind, (firm_name or "Unknown").strip().replace("/", "_"))
+        sub  = os.path.join(base, kind, _firm_dir_name(firm_name or "Unknown"))
         os.makedirs(sub, exist_ok=True)
         path = os.path.join(sub, filename)
         with open(path, "wb") as f:
@@ -1193,20 +1139,40 @@ function addFromChallan(){
 
   const tbody = document.querySelector('#items tbody');
   let current = tbody.querySelectorAll('tr').length;
+
   for(const r of rows){
     if(current >= INV_MAX_ROWS) break;
-    const desc = String(r['Description']||'');
-    const qtyRaw = r['Qty'] !== undefined && r['Qty'] !== "" ? r['Qty'] : (r['MTR'] ?? '');
-    const qty = String(qtyRaw ?? '');
+
+    const desc   = String(r['Description']||'');
+    const qtyRaw = (r['Qty'] !== undefined && r['Qty'] !== "") ? r['Qty'] : (r['MTR'] ?? '');
+    const qtyStr = String(qtyRaw ?? '');
+    const qn     = safeNum(qtyRaw);
+
     let rate = '';
-    if(r['Rate'] !== undefined && r['Rate'] !== null && r['Rate'] !== ''){
+
+    // 1) Prefer explicit Rate field if present
+    if(r['Rate'] !== undefined && r['Rate'] !== null && String(r['Rate']).trim() !== ''){
       rate = String(r['Rate']);
-    }else{
-      const amt = safeNum(r['Amount'] || r['Taxable_Amount']);
-      const qn  = safeNum(qtyRaw);
-      if(qn > 0 && amt) rate = (amt / qn).toFixed(2);
+    } else {
+      // 2) Infer from Amount/Taxable_Amount and Qty
+      const amtCell  = safeNum(r['Amount']);
+      const taxable  = safeNum(r['Taxable_Amount']);
+
+      // If Amount * Qty ~= Taxable_Amount, treat Amount as unit rate
+      if(qn > 0 && amtCell > 0 && Math.abs((amtCell * qn) - taxable) < 0.01){
+        rate = amtCell.toFixed(2);
+      }
+      // Else use Taxable_Amount / Qty if possible
+      else if(qn > 0 && taxable > 0){
+        rate = (taxable / qn).toFixed(2);
+      }
+      // Else last resort: Amount / Qty
+      else if(qn > 0 && amtCell > 0){
+        rate = (amtCell / qn).toFixed(2);
+      }
     }
-    addRow({ ch: chSel, desc: desc, qty: qty, rate: rate });
+
+    addRow({ ch: chSel, desc: desc, qty: qtyStr, rate: rate });
     current++;
   }
 }
@@ -1343,7 +1309,8 @@ def challan():
     )
     data = buf.getvalue()
 
-    # Log rows to "Challan" (NAME-BASED) — also write Rate if the sheet has it
+    # Log rows to "Challan" (NAME-BASED)
+    # Amount is now UNIT rate; Taxable_Amount is total (qty*rate)
     created = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
     for d, q, r, a in items:
         row_dict = {
@@ -1357,16 +1324,17 @@ def challan():
             "Gst_No":                  party["gstin"],
             "Description":             d,
             "Qty":                     f"{q:.2f}",
-            "Rate":                    f"{r:.2f}",   # <- populate if column exists
-            "Amount":                  f"{a:.2f}",
-            "Taxable_Amount":          f"{a:.2f}",
-            # NOTE: INVOICE_MTR intentionally NOT set here
+            "Rate":                    f"{r:.2f}",     # if column exists, it will be filled
+            "Amount":                  f"{r:.2f}",     # <-- unit amount (rate)
+            "Taxable_Amount":          f"{a:.2f}",     # <-- total (qty*rate)
+            # INVOICE_MTR intentionally NOT set here
         }
         append_row_to_challan(row_dict)
 
     # Optional server copy
     timestamp = datetime.now(IST).strftime("%Y%m%d-%H%M%S")
-    dl_name = f"Challan_{ch_no}_{(party['name'] or 'Party').strip().replace(' ','_')}_{timestamp}.pdf"
+    safe_party = re.sub(r'[^A-Za-z0-9_]+', '_', (party['name'] or 'Party').strip().replace(' ', '_'))
+    dl_name = f"{ch_no}_{safe_party}_{timestamp}.pdf"
     _save_copy("challan", company["company_name"], dl_name, data)
 
     return send_file(io.BytesIO(data), as_attachment=True, download_name=_unique_name(dl_name), mimetype="application/pdf")
@@ -1459,7 +1427,7 @@ def invoice():
             str(ch or ""),                    # Challan_Number
             d,                                # Description
             f"{q:.2f}",                       # Qty
-            f"{a:.2f}",                       # Amount
+            f"{a:.2f}",                       # Amount (line total)
             f"{row_taxable:.2f}",             # Taxable_Amount
             f"{row_discount:.2f}",            # Discount
             f"{GST_TOTAL:.0f}%",              # Gst_Percentage
@@ -1474,7 +1442,8 @@ def invoice():
 
     # Optional server copy
     timestamp = datetime.now(IST).strftime("%Y%m%d-%H%M%S")
-    dl_name = f"Invoice_{inv_no}_{(sup['name'] or 'Supplier').strip().replace(' ','_')}_{timestamp}.pdf"
+    safe_sup = re.sub(r'[^A-Za-z0-9_]+', '_', (sup['name'] or 'Supplier').strip().replace(' ', '_'))
+    dl_name = f"{inv_no}_{safe_sup}_{timestamp}.pdf"
     _save_copy("invoice", company["company_name"], dl_name, data)
 
     return send_file(io.BytesIO(data), as_attachment=True, download_name=_unique_name(dl_name), mimetype="application/pdf")
