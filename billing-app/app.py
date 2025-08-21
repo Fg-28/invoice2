@@ -126,7 +126,7 @@ def load_suppliers():
     except Exception as e:
         print("Suppliers load error:", e);  return {}
 
-# ---------- Header normalizer for Challan rows ----------
+# ---------- Header normalizer for Challan rows (for Invoice import UI) ----------
 CANON_KEYS = [
     "Firm","Supplier Code","Challan_Number","INVOICE_MTR","Description","Qty","MTR","Rate","Amount"
 ]
@@ -152,7 +152,7 @@ def load_challan_rows():
         values = ws.get_all_values()
         if not values: return []
         raw_header = values[0]
-        # build map from actual header to canonical key
+        # build map from actual header to canonical key (case-insensitive)
         canon_map = {}
         for h in raw_header:
             keyn = _norm_key(h)
@@ -216,29 +216,35 @@ def check_login_from_sheet(username, password):
     except Exception as e:
         print("PASS sheet error:", e);  return False
 
-# ---------- Ensure/append Challan row with supplier challan no ----------
+# ---------- Ensure Challan header (name-based, no reordering) ----------
+# Required columns (NO Grand_Total here). INVOICE_MTR should exist; we never fill it on challan creation.
 REQ_CHALLAN_HEADER = [
-    "Firm","Createed_Date","Invoice_Date","Challan_Number","Supplier Code",
-    "Supplier_Name","Gst_No","Description","Qty","Amount","Taxable_Amount","Grand_Total",
-    "INVOICE_MTR","supplier_challan_number"
+    "Firm","Createed_Date","Invoice_Date","Challan_Number","supplier_challan_number",
+    "Supplier Code","Supplier_Name","Gst_No","Description","Qty","Amount","Taxable_Amount",
+    "INVOICE_MTR"
 ]
+
 def _ensure_challan_header(ws):
+    """
+    Ensure the Challan sheet contains required columns (case-insensitive).
+    Does not reorder existing columns; missing columns are appended at the end.
+    Returns (header, idx_lower) where idx_lower maps lower(header) -> index.
+    """
     vals = ws.get_all_values()
     header = vals[0] if vals else []
     if not header:
         ws.update("A1", [REQ_CHALLAN_HEADER])
         header = REQ_CHALLAN_HEADER[:]
     else:
-        # add missing required cols at the end
-        lower = [h.strip().lower() for h in header]
+        existing_l = [h.strip().lower() for h in header]
         changed = False
         for col in REQ_CHALLAN_HEADER:
-            if col.lower() not in lower:
+            if col.lower() not in existing_l:
                 header.append(col); changed = True
         if changed:
             ws.update("A1", [header])
-    # index map
-    return header, {h:i for i,h in enumerate(header)}
+    idx_lower = {h.strip().lower(): i for i, h in enumerate(header)}
+    return header, idx_lower
 
 def append_row_to_invoice(row_values):
     try:
@@ -246,27 +252,29 @@ def append_row_to_invoice(row_values):
     except Exception as e:
         print("Append Invoice failed:", e)
 
-def append_row_to_challan(row_values, supplier_challan_number=None):
+def append_row_to_challan(row_dict):
     """
-    Append a challan row and, if provided, set the 'supplier_challan_number'
-    column (auto-creating the column in header when missing).
+    Append a Challan row using column names (case-insensitive).
+    - row_dict: mapping of column_name -> value. We will match by lowercased name.
+    - We never set INVOICE_MTR here (it stays blank until invoicing).
+    - Extra keys are ignored; missing columns remain blank.
     """
     try:
         ws = _ws(CHALLAN_TAB_NAME)
-        header, idx = _ensure_challan_header(ws)
-        # pad row to header length
+        header, idx_lower = _ensure_challan_header(ws)
+
+        # Build a full row (same length as header), default empty strings.
         row = [""] * len(header)
-        # map our standard 12 values first (in the order we generate them)
-        base_cols = [
-            "Firm","Createed_Date","Invoice_Date","Challan_Number","Supplier Code",
-            "Supplier_Name","Gst_No","Description","Qty","Amount","Taxable_Amount","Grand_Total"
-        ]
-        for i, col in enumerate(base_cols):
-            if col in idx and i < len(row_values):
-                row[idx[col]] = row_values[i]
-        # supplier challan no
-        if supplier_challan_number and "supplier_challan_number" in [h.lower() for h in header]:
-            row[idx["supplier_challan_number" if "supplier_challan_number" in idx else header[[h.lower() for h in header].index("supplier_challan_number")]]] = supplier_challan_number
+        # Fill from provided dict
+        for key, val in (row_dict or {}).items():
+            k = (key or "").strip().lower()
+            if not k: continue
+            if k == "invoice_mtr":
+                # never set here
+                continue
+            if k in idx_lower:
+                row[idx_lower[k]] = val
+
         ws.append_row(row, value_input_option="USER_ENTERED")
     except Exception as e:
         print("Append Challan failed:", e)
@@ -281,24 +289,27 @@ def write_invoice_mtr_to_challan(company_name, supplier_code, items):
         Challan_Number == ch_no
         Description == desc
     and write mtr into column 'INVOICE_MTR'.
+    Matching is case-insensitive on headers.
     """
     try:
         ws = _ws(CHALLAN_TAB_NAME)
         all_values = ws.get_all_values()
         if not all_values: return
         header = [h.strip() for h in all_values[0]]
-        idx = {h:i for i,h in enumerate(header)}
-        if "INVOICE_MTR" not in idx:
+        idx_lower = {h.strip().lower(): i for i, h in enumerate(header)}
+
+        # Ensure INVOICE_MTR exists
+        if "invoice_mtr" not in idx_lower:
             header.append("INVOICE_MTR")
             ws.update('A1', [header])
             all_values[0] = header
-            idx = {h:i for i,h in enumerate(header)}
+            idx_lower = {h.strip().lower(): i for i, h in enumerate(header)}
 
         updates = []
         for row_num in range(2, len(all_values)+1):
             row = all_values[row_num-1]
-            def get(col):
-                i = idx.get(col)
+            def get(colname):
+                i = idx_lower.get(colname.lower())
                 return (row[i].strip() if i is not None and i < len(row) else "")
             firm   = get("Firm")
             scode  = get("Supplier Code")
@@ -307,7 +318,7 @@ def write_invoice_mtr_to_challan(company_name, supplier_code, items):
             for (ch, d, sac, q, r, a) in items:
                 if (firm == company_name and scode == supplier_code and
                     str(ch).strip() == str(chno).strip() and (d or "").strip() == (desc or "").strip()):
-                    col = idx["INVOICE_MTR"] + 1
+                    col = idx_lower["invoice_mtr"] + 1
                     updates.append((row_num, col, f"{float(q):.2f}"))
                     break
 
@@ -478,7 +489,7 @@ def draw_challan_pdf(buf, company, party, meta, items):
         c.setFont("Helvetica-Bold", 10); c.drawString(mx, y-16, "Challan Details")
         c.setFont("Helvetica", 9)
         c.drawString(mx,     y-34, f"Challan No.: {meta['no']}")
-        sup_no = meta.get("supplier_no") or meta.get("supplier_challan_no") or ""
+        sup_no = meta.get("supplier_no") or meta.get("supplier_challan_no") or meta.get("supplier_challan_number") or ""
         if sup_no:
             c.drawString(mx, y-50, f"Supplier Ch. No.: {sup_no}")
             c.drawString(mx, y-66, f"Date: {meta['date']}")
@@ -518,7 +529,7 @@ def draw_challan_pdf(buf, company, party, meta, items):
             x += w_rate
             if r < len(items): c.drawRightString(x+w_amt-6, row_y, f"{float(items[r][3]):.2f}")
 
-        # Grand Total
+        # Grand Total (display only)
         sub_y_top = data_top_y - data_h
         c.setFont("Helvetica-Bold", 9)
         c.rect(L+1, sub_y_top-18, table_w - w_amt, 18)
@@ -1234,29 +1245,30 @@ def challan():
         buf,
         company=company,
         party=party,
-        meta={"no": ch_no, "date": ch_dt, "supplier_no": supplier_challan_number},
+        meta={"no": ch_no, "date": ch_dt, "supplier_challan_number": supplier_challan_number},
         items=items[:CH_MAX_ROWS]
     )
     data = buf.getvalue()
 
-    # Log rows to "Challan"
+    # Log rows to "Challan" (NAME-BASED)
     created = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
     for d, q, r, a in items:
-        row = [
-            company["company_name"],  # Firm
-            created,                  # Createed_Date
-            ch_dt,                    # Invoice_Date (kept name)
-            ch_no,                    # Challan_Number
-            party_code,               # Supplier Code
-            party["name"],            # Supplier_Name
-            party["gstin"],           # Gst_No
-            d,                        # Description
-            f"{q:.2f}",               # Qty
-            f"{a:.2f}",               # Amount
-            f"{a:.2f}",               # Taxable_Amount
-            f"{a:.2f}",               # Grand_Total
-        ]
-        append_row_to_challan(row, supplier_challan_number=supplier_challan_number)
+        row_dict = {
+            "Firm":                    company["company_name"],
+            "Createed_Date":           created,
+            "Invoice_Date":            ch_dt,
+            "Challan_Number":          ch_no,
+            "supplier_challan_number": supplier_challan_number,
+            "Supplier Code":           party_code,
+            "Supplier_Name":           party["name"],
+            "Gst_No":                  party["gstin"],
+            "Description":             d,
+            "Qty":                     f"{q:.2f}",
+            "Amount":                  f"{a:.2f}",
+            "Taxable_Amount":          f"{a:.2f}",
+            # NOTE: INVOICE_MTR intentionally NOT set here
+        }
+        append_row_to_challan(row_dict)
 
     # Optional server copy
     timestamp = datetime.now(IST).strftime("%Y%m%d-%H%M%S")
@@ -1275,7 +1287,7 @@ def invoice():
     firm_keys = list(firms.keys())
     if request.method == "GET":
         return render_template("invoice.html",
-                               firms=firms, suppliers=suppliers, challans=challans,
+                               firms=firms, suppliers=suppliers, challans=challlans if False else challans,
                                next_no=get_next_invoice_number(),
                                today=datetime.now(IST).strftime("%d/%m/%Y"),
                                sac_default=SAC_DEFAULT,
