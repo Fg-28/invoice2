@@ -7,7 +7,7 @@
 # - Invoice: GST @ env GST_TOTAL (default 5%), global SAC, logs to "Invoice"
 # - Firms from "ID" tab, Suppliers from "Supplier" tab
 #
-# pip install: flask gspread google-auth reportlab gunicorn
+# pip install: flask gspread google-auth reportlab gunicorn requests
 
 import os, re, io, json, base64
 from datetime import datetime, timedelta
@@ -29,15 +29,14 @@ import gspread
 from google.oauth2.service_account import Credentials as SA_Credentials
 from jinja2 import DictLoader
 
+import requests  # <-- for remote logo URLs
+
 # ==============================
 # Config from ENV
 # ==============================
 SPREADSHEET_ID   = os.getenv("SPREADSHEET_ID")        # required
 GOOGLE_SA_JSON   = os.getenv("GOOGLE_SA_JSON")        # service account JSON (single env var)
 SESSION_SECRET   = os.getenv("SESSION_SECRET", "change-me")
-
-# Local logo directory (relative to app root by default; normalized to absolute after app is created)
-LOGO_DIR = os.getenv("LOGO_DIR", os.path.join("invoice2", "billing-app", "static", "logos"))
 
 # Optional: where to save a server-side copy (works if path exists & writable)
 SAVE_DIR = os.getenv("SAVE_DIR", "").strip()
@@ -61,33 +60,92 @@ CH_MAX_ROWS  = 5
 
 IST = ZoneInfo("Asia/Kolkata")
 
+# Optional overrides for logos (by UPPERCASE firm name). You can also set via env:
+#   LOGO_OVERRIDES='{"JAY VALAM":"https://i.postimg.cc/Hn9f1HCy/jay-valam.jpg"}'
+LOGO_OVERRIDES_DEFAULT = {
+    "JAY VALAM": "https://i.postimg.cc/Hn9f1HCy/jay-valam.jpg"  # your Postimages direct link
+}
+try:
+    LOGO_OVERRIDES_ENV = json.loads(os.getenv("LOGO_OVERRIDES", "{}"))
+except Exception:
+    LOGO_OVERRIDES_ENV = {}
+LOGO_OVERRIDES = {**LOGO_OVERRIDES_DEFAULT, **LOGO_OVERRIDES_ENV}
+
+# Local logo directory (fallback only)
+LOGO_DIR = os.getenv("LOGO_DIR", os.path.join("invoice2", "billing-app", "static", "logos"))
+
 app = Flask(__name__)
 app.secret_key = SESSION_SECRET
 app.permanent_session_lifetime = timedelta(days=30)  # "remember me"
 
-# Normalize LOGO_DIR to an absolute path (so we don't depend on current working dir)
-if not os.path.isabs(LOGO_DIR):
-    LOGO_DIR = os.path.normpath(os.path.join(app.root_path, LOGO_DIR))
+# Normalize a usable local logos base (fallback)
+def _candidate_logo_dirs():
+    cands = []
+    cands.append(LOGO_DIR)
+    cands.append(os.path.join(app.root_path, LOGO_DIR))
+    cands.append(os.path.join(app.root_path, "invoice2", "billing-app", "static", "logos"))
+    cands.append(os.path.join(app.root_path, "billing-app", "static", "logos"))
+    cands.append(os.path.join(app.root_path, "static", "logos"))
+    cands.append(os.path.join(app.root_path, "logos"))
+    out, seen = [], set()
+    for p in cands:
+        p = os.path.normpath(p)
+        if p not in seen:
+            out.append(p); seen.add(p)
+    return out
+
+LOGO_BASE_DIR = next((p for p in _candidate_logo_dirs() if os.path.isdir(p)), None)
 
 # ==============================
 # Small helpers
 # ==============================
-def _slug_lower(name: str) -> str:
-    # lowercased, spaces & non-alnum to _
+def _slug_lower(name):
     return re.sub(r'[^a-z0-9]+', '_', (name or '').lower()).strip('_')
 
-def _firm_dir_name(name: str) -> str:
-    # Firm folder name: keep case, spaces -> underscores
+def _firm_dir_name(name):
     return re.sub(r'\s+', '_', (name or '').strip())
 
-def _local_logo_path(company_name: str) -> str | None:
-    # Only return an existing file; prefer .jpeg, accept .jpg/.png/.webp
+def _local_logo_path(company_name):
+    if not LOGO_BASE_DIR:
+        return None
     slug = _slug_lower(company_name)
     for ext in (".jpeg", ".jpg", ".png", ".webp"):
-        p = os.path.join(LOGO_DIR, slug + ext)
+        p = os.path.join(LOGO_BASE_DIR, slug + ext)
         if os.path.exists(p):
             return p
     return None
+
+# HTTP session for remote logos
+HTTP = requests.Session()
+HTTP.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
+})
+
+def _normalize_remote_url(u):
+    u = u.strip()
+    # Google Drive share -> direct
+    if u.startswith("https://drive.google.com/file/d/"):
+        m = re.search(r"/file/d/([^/]+)/", u)
+        if m: return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
+    # Dropbox share -> raw
+    if "dropbox.com" in u and "raw=1" not in u and "dl=1" not in u:
+        sep = "&" if "?" in u else "?"
+        u = u + sep + "raw=1"
+    # Imgur page -> direct
+    if "imgur.com" in u and "i.imgur.com" not in u:
+        m = re.search(r"imgur\.com/([^./?]+)$", u)
+        if m: return f"https://i.imgur.com/{m.group(1)}.jpg"
+        u = u.replace("://imgur.com/", "://i.imgur.com/")
+    return u
+
+def _resolve_og_image(page_url):
+    try:
+        r = HTTP.get(page_url, timeout=8)
+        r.raise_for_status()
+        m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', r.text, re.I)
+        return m.group(1) if m else None
+    except Exception:
+        return None
 
 # ==============================
 # Google Sheets helpers
@@ -104,7 +162,7 @@ def _ws(sheet_name):
     return gc.open_by_key(SPREADSHEET_ID).worksheet(sheet_name)
 
 def load_firms():
-    """Return dict: key -> profile dict (logo loaded from local LOGO_DIR)."""
+    """Return dict: key -> profile dict (logo from sheet link or override, else local fallback)."""
     try:
         ws = _ws(ID_TAB_NAME)
         rows = ws.get_all_values()
@@ -118,14 +176,16 @@ def load_firms():
             if not r or not any(r): continue
             firm = val(r, "firm")
             if not firm: continue
-            out[firm.upper()] = {
-                "title_name": firm.upper(),
+            firm_uc = firm.upper()
+            sheet_logo = val(r, "logolink")  # put your Postimages direct link here in the sheet
+            out[firm_uc] = {
+                "title_name": firm_uc,
                 "company_name": firm,
                 "addr": val(r,"address"),
                 "mobile": val(r,"number"),
                 "gst": val(r,"gst"),
-                # always prefer local static logo (lowercase + underscores + .jpeg/.jpg/.png/.webp)
-                "logo": _local_logo_path(firm),
+                # priority: sheet link -> env/default overrides -> local file fallback
+                "logo": (sheet_logo or LOGO_OVERRIDES.get(firm_uc) or _local_logo_path(firm)),
                 "bank_lines": [
                     f"Bank: {val(r,'bank') or '—'}",
                     f"A/C Name: {val(r,'account_name') or '—'}",
@@ -252,7 +312,7 @@ def check_login_from_sheet(username, password):
 REQ_CHALLAN_HEADER = [
     "Firm","Createed_Date","Invoice_Date","Challan_Number","supplier_challan_number",
     "Supplier Code","Supplier_Name","Gst_No","Description","Qty","Amount","Taxable_Amount",
-    "INVOICE_MTR"
+    "INVOICE_MTR","Rate"
 ]
 
 def _ensure_challan_header(ws):
@@ -294,14 +354,12 @@ def append_row_to_challan(row_dict):
         ws = _ws(CHALLAN_TAB_NAME)
         header, idx_lower = _ensure_challan_header(ws)
 
-        # Build a full row (same length as header), default empty strings.
         row = [""] * len(header)
-        # Fill from provided dict
         for key, val in (row_dict or {}).items():
             k = (key or "").strip().lower()
             if not k: continue
             if k == "invoice_mtr":
-                continue  # never set at challan creation
+                continue
             if k in idx_lower:
                 row[idx_lower[k]] = val
 
@@ -313,13 +371,8 @@ def append_row_to_challan(row_dict):
 def write_invoice_mtr_to_challan(company_name, supplier_code, items):
     """
     For each item (ch_no, desc, sac, mtr, rate, amt) written to invoice,
-    find rows in Challan sheet that match:
-        Firm == company_name
-        Supplier Code == supplier_code
-        Challan_Number == ch_no
-        Description == desc
+    find rows in Challan sheet that match Firm + Supplier Code + Challan_Number + Description,
     and write mtr into column 'INVOICE_MTR'.
-    Matching is case-insensitive on headers.
     """
     try:
         ws = _ws(CHALLAN_TAB_NAME)
@@ -420,36 +473,56 @@ def _num_words(n):
 def _rupees_words(v):  return f"{_num_words(int(round(v)))} Rupees Only"
 
 def _image_reader_from_src(src):
-    """Support local file path or data URI (base64). Skip cleanly if missing."""
     if not src:
         return None
-    src = src.strip()
-    try:
-        if src.startswith("data:image/"):
-            header, b64 = src.split(",", 1)
+    u = src.strip()
+
+    # 1) data URI
+    if u.startswith("data:image/"):
+        try:
+            header, b64 = u.split(",", 1)
             data = base64.b64decode(b64)
             return ImageReader(io.BytesIO(data))
+        except Exception as e:
+            print("Logo decode skipped:", e)
+            return None
 
-        # If it's a path, ensure it exists (absolute or relative to app.root_path)
-        if os.path.exists(src):
-            with open(src, "rb") as f:
+    # 2) local file?
+    try:
+        if os.path.exists(u):
+            with open(u, "rb") as f:
                 return ImageReader(io.BytesIO(f.read()))
-
-        if not os.path.isabs(src):
-            abs_candidate = os.path.join(app.root_path, src)
+        if not os.path.isabs(u):
+            abs_candidate = os.path.join(app.root_path, u)
             if os.path.exists(abs_candidate):
                 with open(abs_candidate, "rb") as f:
                     return ImageReader(io.BytesIO(f.read()))
-
-        # Missing -> skip quietly
-        return None
-
     except Exception as e:
-        print("Logo load skipped:", e)
-        return None
+        print("Logo local read skipped:", e)
+
+    # 3) remote http(s)?
+    if u.startswith("http://") or u.startswith("https://"):
+        u = _normalize_remote_url(u)
+        looks_like_page = not re.search(r"\.(jpg|jpeg|png|webp|gif)(\?|$)", u, re.I)
+        if looks_like_page:
+            og = _resolve_og_image(u)
+            if og:
+                u = og
+        try:
+            r = HTTP.get(u, timeout=10)
+            r.raise_for_status()
+            ctype = r.headers.get("Content-Type","").lower()
+            if not (ctype.startswith("image/") or ctype.startswith("application/octet-stream")):
+                return None
+            return ImageReader(io.BytesIO(r.content))
+        except Exception as e:
+            print("Logo remote fetch skipped:", e)
+            return None
+
+    # 4) give up quietly
+    return None
 
 def _draw_logo(c, logo_src, x_right, y_top, max_w, max_h):
-    """Draw logo whose top-right corner is at (x_right, y_top)."""
     try:
         img = _image_reader_from_src(logo_src)
         if not img: return
@@ -510,13 +583,13 @@ def draw_challan_pdf(buf, company, party, meta, items):
         c.drawString(L+8, ay, f"Mobile: {company['mobile']}   |   GST No.: {company['gst']}")
         _draw_logo(c, company.get("logo"), x_right=R-10, y_top=y-8, max_w=140, max_h=46)
 
-        y = ay - 24   # spacing so text doesn't touch the partitions
+        y = ay - 24
 
         # Partitions
         part_h = 112
         left_w = (R - L - 2) / 2
-        c.rect(L+1, y-part_h, left_w, part_h)            # left partition
-        c.rect(L+1+left_w, y-part_h, left_w, part_h)     # right partition
+        c.rect(L+1, y-part_h, left_w, part_h)
+        c.rect(L+1+left_w, y-part_h, left_w, part_h)
 
         # Left content (party)
         c.setFont("Helvetica-Bold", 10)
@@ -709,7 +782,7 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
     c.rect(L+1+w_ch+w_desc+w_sac+w_mtr+w_rate, sub_y_top-18, w_amt, 18)
     c.drawRightString(L+1+table_w-6, sub_y_top-12, f"{sub_total:.2f}")
 
-    # Bottom area (Amounts in Words + Bank details + Summary)
+    # Bottom area
     ybot = sub_y_top - 26
     bottom_h = 200
     c.rect(L+1, ybot-bottom_h, table_w, bottom_h)
@@ -755,7 +828,7 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
     c.drawString(rx, yy-2, "Grand Total (₹)")
     c.drawRightString(rv, yy-2, f"{int(round(rounded))}")
 
-    # Signatures at page bottom
+    # Signatures
     c.setFont("Helvetica", 9)
     c.drawString(L+10, B+22, "Customer Signature")
     c.drawRightString(R-10, B+22, f"For {company['company_name']}")
@@ -1104,7 +1177,6 @@ function refreshChallanOptions(){
   sel.innerHTML = '<option value="">-- select challan --</option>';
   if(!firm || !scode) return;
 
-  // group rows by challan number for this firm+supplier
   const grouped = {};
   CHALLAN_ROWS.forEach(r=>{
     const rf = String(r['Firm']||'').toUpperCase();
@@ -1116,7 +1188,6 @@ function refreshChallanOptions(){
     grouped[ch].push(r);
   });
 
-  // Show challan if it has at least one UNINVOICED row (INVOICE_MTR is blank)
   Object.keys(grouped).sort().forEach(ch=>{
     const rows = grouped[ch];
     const hasUninvoiced = rows.some(x => String(x['INVOICE_MTR']||'').trim() === '');
@@ -1141,7 +1212,7 @@ function addFromChallan(){
     String(r['Firm']||'').toUpperCase() === firm &&
     String(r['Supplier Code']||'') === scode &&
     String(r['Challan_Number']||'').trim() === chSel &&
-    String(r['INVOICE_MTR']||'').trim() === '' // ONLY not yet invoiced
+    String(r['INVOICE_MTR']||'').trim() === ''
   );
 
   const tbody = document.querySelector('#items tbody');
@@ -1157,26 +1228,17 @@ function addFromChallan(){
 
     let rate = '';
 
-    // 1) Prefer explicit Rate field if present
     if(r['Rate'] !== undefined && r['Rate'] !== null && String(r['Rate']).trim() !== ''){
       rate = String(r['Rate']);
     } else {
-      // 2) Infer from Amount/Taxable_Amount and Qty
-      const amtCell  = safeNum(r['Amount']);
-      const taxable  = safeNum(r['Taxable_Amount']);
-
-      // If Amount * Qty ~= Taxable_Amount, treat Amount as unit rate
-      if(qn > 0 && amtCell > 0 && Math.abs((amtCell * qn) - taxable) < 0.01){
+      const amtCell  = safeNum(r['Amount']);          // unit if using our new challan logging
+      const taxable  = safeNum(r['Taxable_Amount']);  // total
+      if(qn > 0 && amtCell > 0 and abs((amtCell * qn) - taxable) < 0.01):
         rate = amtCell.toFixed(2);
-      }
-      // Else use Taxable_Amount / Qty if possible
-      else if(qn > 0 && taxable > 0){
+      elif qn > 0 and taxable > 0:
         rate = (taxable / qn).toFixed(2);
-      }
-      // Else last resort: Amount / Qty
-      else if(qn > 0 && amtCell > 0){
+      elif qn > 0 and amtCell > 0:
         rate = (amtCell / qn).toFixed(2);
-      }
     }
 
     addRow({ ch: chSel, desc: desc, qty: qtyStr, rate: rate });
@@ -1316,8 +1378,8 @@ def challan():
     )
     data = buf.getvalue()
 
-    # Log rows to "Challan" (NAME-BASED)
-    # Amount is now UNIT rate; Taxable_Amount is total (qty*rate)
+    # Log rows to "Challan"
+    # Amount = unit rate; Taxable_Amount = total (qty*rate)
     created = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
     for d, q, r, a in items:
         row_dict = {
@@ -1331,9 +1393,9 @@ def challan():
             "Gst_No":                  party["gstin"],
             "Description":             d,
             "Qty":                     f"{q:.2f}",
-            "Rate":                    f"{r:.2f}",     # if column exists, it will be filled
-            "Amount":                  f"{r:.2f}",     # <-- unit amount (rate)
-            "Taxable_Amount":          f"{a:.2f}",     # <-- total (qty*rate)
+            "Rate":                    f"{r:.2f}",
+            "Amount":                  f"{r:.2f}",     # unit amount (rate)
+            "Taxable_Amount":          f"{a:.2f}",     # total (qty*rate)
             # INVOICE_MTR intentionally NOT set here
         }
         append_row_to_challan(row_dict)
