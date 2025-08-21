@@ -1,6 +1,7 @@
 # single-file web app: Challan + Invoice (Flask) with Google Sheets + PDF
 # - Deployable on Railway (or any host)
 # - Secrets via ENV: SPREADSHEET_ID, GOOGLE_SA_JSON, SESSION_SECRET
+# - Optional ENV: SAVE_DIR (local folder to save server-side copies; e.g. C:\Invoice_challan)
 # - Login reads ID/PASS from Google Sheet tab "PASS" (A2=id, B2=pass)
 # - Challan: 2 copies per page, 5 rows, no GST/discount, logs to "Challan"
 # - Invoice: GST @ env GST_TOTAL (default 5%), global SAC, logs to "Invoice"
@@ -8,8 +9,9 @@
 #
 # pip install: flask gspread google-auth reportlab gunicorn
 
-import os, re, io, json
+import os, re, io, json, base64
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from functools import wraps
 
 from flask import (
@@ -21,7 +23,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib import colors
 from reportlab.pdfbase import pdfmetrics
-from reportlab.lib.utils import ImageReader  # <-- for logo
+from reportlab.lib.utils import ImageReader
 
 import gspread
 from google.oauth2.service_account import Credentials as SA_Credentials
@@ -33,6 +35,9 @@ from jinja2 import DictLoader
 SPREADSHEET_ID   = os.getenv("SPREADSHEET_ID")        # required
 GOOGLE_SA_JSON   = os.getenv("GOOGLE_SA_JSON")        # service account JSON (single env var)
 SESSION_SECRET   = os.getenv("SESSION_SECRET", "change-me")
+
+# Optional: where to save a server-side copy (works if path exists & writable)
+SAVE_DIR         = os.getenv("SAVE_DIR", "").strip()  # e.g. C:\Invoice_challan
 
 # Sheet names
 ID_TAB_NAME        = os.getenv("ID_TAB_NAME", "ID")
@@ -48,6 +53,8 @@ SAC_DEFAULT = os.getenv("SAC_DEFAULT", "123456")
 
 INV_MAX_ROWS = 10
 CH_MAX_ROWS  = 5
+
+IST = ZoneInfo("Asia/Kolkata")
 
 app = Flask(__name__)
 app.secret_key = SESSION_SECRET
@@ -88,7 +95,7 @@ def load_firms():
                 "addr": val(r,"address"),
                 "mobile": val(r,"number"),
                 "gst": val(r,"gst"),
-                "logo": val(r,"logolink"),  # <-- logo URL/path
+                "logo": val(r,"logolink"),  # <-- logo URL/path/data-URI
                 "bank_lines": [
                     f"Bank: {val(r,'bank') or '—'}",
                     f"A/C Name: {val(r,'account_name') or '—'}",
@@ -119,11 +126,55 @@ def load_suppliers():
     except Exception as e:
         print("Suppliers load error:", e);  return {}
 
+# ---------- Header normalizer for Challan rows ----------
+CANON_KEYS = [
+    "Firm","Supplier Code","Challan_Number","INVOICE_MTR","Description","Qty","MTR","Rate","Amount"
+]
+def _norm_key(s): return re.sub(r"[^a-z0-9]+","", (s or "").lower())
+
+# map many variants to our canonical keys
+KEY_SYNONYMS = {
+    "Firm": ["firm","company","companyname"],
+    "Supplier Code": ["suppliercode","partycode","supplier_code","supplier"],
+    "Challan_Number": ["challanno","challan_no","challannumber","challan"],
+    "INVOICE_MTR": ["invoice_mtr","invoicemtr","invoicemeter"],
+    "Description": ["description","desc","productname","item","particulars"],
+    "Qty": ["qty","quantity","qnt","meter","metre","meters","mtrs","mtr_qty"],
+    "MTR": ["mtr","meter","metre","meters","qty"],  # fallback mirror
+    "Rate": ["rate","price","per","perunit","per_mtr"],
+    "Amount": ["amount","amt","total","subtotal","grandtotal"],
+}
+
 def load_challan_rows():
-    """Return list of challan rows (used to import into Invoice)."""
+    """Return list of rows with canonical keys so the Invoice UI always sees them."""
     try:
         ws = _ws(CHALLAN_TAB_NAME)
-        return ws.get_all_records()
+        values = ws.get_all_values()
+        if not values: return []
+        raw_header = values[0]
+        # build map from actual header to canonical key
+        canon_map = {}
+        for h in raw_header:
+            keyn = _norm_key(h)
+            for canon, alts in KEY_SYNONYMS.items():
+                if keyn in { _norm_key(x) for x in ([canon] + alts) }:
+                    canon_map[h] = canon
+                    break
+        rows = []
+        for r in values[1:]:
+            if not any(r): continue
+            rec = {}
+            for i, cell in enumerate(r):
+                if i >= len(raw_header): break
+                h = raw_header[i]
+                canon = canon_map.get(h)
+                if canon:
+                    rec[canon] = cell
+            # Ensure all canonical keys exist (maybe empty)
+            for ck in CANON_KEYS:
+                rec.setdefault(ck, "")
+            rows.append(rec)
+        return rows
     except Exception as e:
         print("Challan load error:", e);  return []
 
@@ -165,6 +216,30 @@ def check_login_from_sheet(username, password):
     except Exception as e:
         print("PASS sheet error:", e);  return False
 
+# ---------- Ensure/append Challan row with supplier challan no ----------
+REQ_CHALLAN_HEADER = [
+    "Firm","Createed_Date","Invoice_Date","Challan_Number","Supplier Code",
+    "Supplier_Name","Gst_No","Description","Qty","Amount","Taxable_Amount","Grand_Total",
+    "INVOICE_MTR","supplier_challan_number"
+]
+def _ensure_challan_header(ws):
+    vals = ws.get_all_values()
+    header = vals[0] if vals else []
+    if not header:
+        ws.update("A1", [REQ_CHALLAN_HEADER])
+        header = REQ_CHALLAN_HEADER[:]
+    else:
+        # add missing required cols at the end
+        lower = [h.strip().lower() for h in header]
+        changed = False
+        for col in REQ_CHALLAN_HEADER:
+            if col.lower() not in lower:
+                header.append(col); changed = True
+        if changed:
+            ws.update("A1", [header])
+    # index map
+    return header, {h:i for i,h in enumerate(header)}
+
 def append_row_to_invoice(row_values):
     try:
         _ws(INVOICE_TAB_NAME).append_row(row_values, value_input_option="USER_ENTERED")
@@ -178,28 +253,21 @@ def append_row_to_challan(row_values, supplier_challan_number=None):
     """
     try:
         ws = _ws(CHALLAN_TAB_NAME)
-
-        # Ensure header exists and contains 'supplier_challan_number'
-        all_vals = ws.get_all_values()
-        if not all_vals:
-            print("Challan sheet seems empty; cannot append.")
-            return
-        header = list(all_vals[0])
-        lower  = [h.strip().lower() for h in header]
-        if "supplier_challan_number" not in lower:
-            header.append("supplier_challan_number")
-            ws.update("A1", [header])
-            lower = [h.strip().lower() for h in header]
-
-        # Remember next row index BEFORE appending (1-based)
-        next_row = len(all_vals) + 1
-
-        ws.append_row(row_values, value_input_option="USER_ENTERED")
-
-        if supplier_challan_number:
-            col = lower.index("supplier_challan_number") + 1
-            ws.update_cell(next_row, col, supplier_challan_number)
-
+        header, idx = _ensure_challan_header(ws)
+        # pad row to header length
+        row = [""] * len(header)
+        # map our standard 12 values first (in the order we generate them)
+        base_cols = [
+            "Firm","Createed_Date","Invoice_Date","Challan_Number","Supplier Code",
+            "Supplier_Name","Gst_No","Description","Qty","Amount","Taxable_Amount","Grand_Total"
+        ]
+        for i, col in enumerate(base_cols):
+            if col in idx and i < len(row_values):
+                row[idx[col]] = row_values[i]
+        # supplier challan no
+        if supplier_challan_number and "supplier_challan_number" in [h.lower() for h in header]:
+            row[idx["supplier_challan_number" if "supplier_challan_number" in idx else header[[h.lower() for h in header].index("supplier_challan_number")]]] = supplier_challan_number
+        ws.append_row(row, value_input_option="USER_ENTERED")
     except Exception as e:
         print("Append Challan failed:", e)
 
@@ -310,20 +378,51 @@ def _num_words(n):
 
 def _rupees_words(v):  return f"{_num_words(int(round(v)))} Rupees Only"
 
-def _draw_logo(c, logo_url, x_right, y_top, max_w, max_h):
+def _image_reader_from_src(src):
+    """Support http(s) URL, file path, or data URI (base64)."""
+    if not src: return None
+    src = src.strip()
+    try:
+        if src.startswith("data:image/"):
+            header, b64 = src.split(",", 1)
+            data = base64.b64decode(b64)
+            return ImageReader(io.BytesIO(data))
+        # http(s) URL or local path
+        return ImageReader(src)
+    except Exception as e:
+        print("Logo load skipped:", e)
+        return None
+
+def _draw_logo(c, logo_src, x_right, y_top, max_w, max_h):
     """Draw logo whose top-right corner is at (x_right, y_top)."""
     try:
-        if not logo_url: return
-        img = ImageReader(logo_url)  # supports file path or URL
+        img = _image_reader_from_src(logo_src)
+        if not img: return
         iw, ih = img.getSize()
         scale = min(max_w/iw, max_h/ih)
         w = iw * scale
         h = ih * scale
-        # position so that the image's top-right is anchored
         c.drawImage(img, x_right - w, y_top - h, w, h, preserveAspectRatio=True, mask='auto')
     except Exception as e:
-        # Fail silently if logo can't be fetched/read
         print("Logo draw skipped:", e)
+
+# ===== Saving to local disk (optional) =====
+def _save_copy(kind, firm_name, filename, data_bytes):
+    """
+    Save to SAVE_DIR\<kind>\<FIRM>\filename if SAVE_DIR is set & writable.
+    kind: 'invoice' | 'challan'
+    """
+    try:
+        if not SAVE_DIR: return
+        base = os.path.abspath(SAVE_DIR)
+        sub  = os.path.join(base, kind, (firm_name or "Unknown").strip().replace("/", "_"))
+        os.makedirs(sub, exist_ok=True)
+        path = os.path.join(sub, filename)
+        with open(path, "wb") as f:
+            f.write(data_bytes)
+        print(f"Saved copy at: {path}")
+    except Exception as e:
+        print("Skip saving copy:", e)
 
 # --------- Draw Challan (two copies) ---------
 def draw_challan_pdf(buf, company, party, meta, items):
@@ -349,17 +448,15 @@ def draw_challan_pdf(buf, company, party, meta, items):
         c.setFont("Helvetica", 9)
         inner_w = (R-L-2) - 16
         ay = y - 30
-        for ln in _wrap(f"Address: {company['addr']}", inner_w - 160):  # leave space for logo
+        for ln in _wrap(f"Address: {company['addr']}", inner_w - 160):
             c.drawString(L+8, ay, ln); ay -= 12
         c.drawString(L+8, ay, f"Mobile: {company['mobile']}   |   GST No.: {company['gst']}")
-
-        # Logo (top-right of the header block)
         _draw_logo(c, company.get("logo"), x_right=R-10, y_top=y-8, max_w=140, max_h=46)
 
         y = ay - 24   # spacing so text doesn't touch the partitions
 
-        # Partitions (flush to border, no gaps)
-        part_h = 112  # a bit taller to accommodate extra 'Supplier Ch. No.'
+        # Partitions
+        part_h = 112
         left_w = (R - L - 2) / 2
         c.rect(L+1, y-part_h, left_w, part_h)            # left partition
         c.rect(L+1+left_w, y-part_h, left_w, part_h)     # right partition
@@ -381,7 +478,6 @@ def draw_challan_pdf(buf, company, party, meta, items):
         c.setFont("Helvetica-Bold", 10); c.drawString(mx, y-16, "Challan Details")
         c.setFont("Helvetica", 9)
         c.drawString(mx,     y-34, f"Challan No.: {meta['no']}")
-        # Supplier Challan No. directly BELOW our challan number
         sup_no = meta.get("supplier_no") or meta.get("supplier_challan_no") or ""
         if sup_no:
             c.drawString(mx, y-50, f"Supplier Ch. No.: {sup_no}")
@@ -468,15 +564,13 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
     c.setFont("Helvetica", 9)
     inner_w = (R - L - 2) - 20
     ay = y - 30
-    for ln in _wrap(f"Address: {company['addr']}", inner_w - 160):  # leave space for logo
+    for ln in _wrap(f"Address: {company['addr']}", inner_w - 160):
         c.drawString(L+10, ay, ln); ay -= 12
     c.drawString(L+10, ay, f"Mobile: {company['mobile']}   |   GST No.: {company['gst']}")
-    # Logo on top-right of the company block
     _draw_logo(c, company.get("logo"), x_right=R-10, y_top=y-8, max_w=140, max_h=46)
+    y = ay - 24
 
-    y = ay - 24  # space before partitions
-
-    # Partitions (Supplier details | Invoice details) — flush, no gap
+    # Partitions
     part_h = 130
     left_w = (R - L - 2) / 2
     c.rect(L+1, y-part_h, left_w, part_h)
@@ -504,7 +598,7 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
     c.drawString(mx,     y-36, f"Invoice No.: {inv_meta['no']}")
     c.drawString(mx,     y-52, f"Date: {inv_meta['date']}")
 
-    # Items table (Ch. No, Product, SAC, MTR, Rate, Amount)
+    # Items table
     ytbl = y-part_h-12
     table_w = (R-L-2)
     w_ch, w_desc, w_sac, w_mtr, w_rate = 65, 240, 70, 60, 60
@@ -969,7 +1063,7 @@ function refreshChallanOptions(){
   Object.keys(grouped).sort().forEach(ch=>{
     const rows = grouped[ch];
     const hasUninvoiced = rows.some(x => String(x['INVOICE_MTR']||'').trim() === '');
-    if(!hasUninvoiced) return; // hide fully invoiced challan
+    if(!hasUninvoiced) return;
     const firstDesc = (rows.find(x => String(x['INVOICE_MTR']||'').trim() === '')?.['Description']) || rows[0]['Description'] || '';
     const short = String(firstDesc).slice(0,28);
     const opt = document.createElement('option');
@@ -990,7 +1084,7 @@ function addFromChallan(){
     String(r['Firm']||'').toUpperCase() === firm &&
     String(r['Supplier Code']||'') === scode &&
     String(r['Challan_Number']||'').trim() === chSel &&
-    String(r['INVOICE_MTR']||'').trim() === '' // <-- ONLY rows not yet invoiced
+    String(r['INVOICE_MTR']||'').trim() === '' // ONLY not yet invoiced
   );
 
   const tbody = document.querySelector('#items tbody');
@@ -998,11 +1092,10 @@ function addFromChallan(){
   for(const r of rows){
     if(current >= INV_MAX_ROWS) break;
     const desc = String(r['Description']||'');
-    const qtyRaw = r.hasOwnProperty('Qty') ? r['Qty'] : (r.hasOwnProperty('MTR') ? r['MTR'] : '');
+    const qtyRaw = r['Qty'] !== undefined && r['Qty'] !== "" ? r['Qty'] : (r['MTR'] ?? '');
     const qty = String(qtyRaw ?? '');
-    // Rate: prefer explicit 'Rate', else compute Amount / Qty (or MTR)
     let rate = '';
-    if(r.hasOwnProperty('Rate') && r['Rate'] !== '' && r['Rate'] !== null){
+    if(r['Rate'] !== undefined && r['Rate'] !== null && r['Rate'] !== ''){
       rate = String(r['Rate']);
     }else{
       const amt = safeNum(r['Amount']);
@@ -1014,9 +1107,7 @@ function addFromChallan(){
   }
 }
 
-window.addEventListener('DOMContentLoaded', ()=>{
-  refreshChallanOptions();
-});
+window.addEventListener('DOMContentLoaded', ()=>{ refreshChallanOptions(); });
 
 // --- Submit via fetch -> download -> reset form ---
 document.getElementById('invoiceForm').addEventListener('submit', async (e)=>{
@@ -1034,11 +1125,11 @@ document.getElementById('invoiceForm').addEventListener('submit', async (e)=>{
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a'); a.href = url; a.download = fname; document.body.appendChild(a); a.click();
     setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 500);
-    // reset form (clear supplier & items)
+    // reset form
     e.target.reset();
     document.querySelector('#items tbody').innerHTML = '';
     addRow();
-    refreshChallanOptions(); // refresh challan list after reset
+    refreshChallanOptions();
   }catch(err){
     alert(err.message || err);
   }finally{
@@ -1099,7 +1190,7 @@ def challan():
         return render_template("challan.html",
                                firms=firms, suppliers=suppliers,
                                next_no=get_next_challan_number(),
-                               today=datetime.now().strftime("%d/%m/%Y"),
+                               today=datetime.now(IST).strftime("%d/%m/%Y"),
                                CH_MAX_ROWS=CH_MAX_ROWS,
                                firm_default=(firm_keys[0] if firm_keys else ""))
     # POST: build items and PDF, append rows
@@ -1117,7 +1208,7 @@ def challan():
     }
 
     ch_no  = request.form.get("challan_no") or "1"
-    ch_dt  = request.form.get("challan_date") or datetime.now().strftime("%d/%m/%Y")
+    ch_dt  = request.form.get("challan_date") or datetime.now(IST).strftime("%d/%m/%Y")
     supplier_challan_number = request.form.get("supplier_challan_number","").strip()
 
     descs = request.form.getlist("desc[]")
@@ -1137,7 +1228,7 @@ def challan():
         flash("Add at least one valid item.", "error")
         return redirect(url_for("challan"))
 
-    # Create PDF to memory
+    # Create PDF in memory
     buf = io.BytesIO()
     draw_challan_pdf(
         buf,
@@ -1146,29 +1237,33 @@ def challan():
         meta={"no": ch_no, "date": ch_dt, "supplier_no": supplier_challan_number},
         items=items[:CH_MAX_ROWS]
     )
-    buf.seek(0)
+    data = buf.getvalue()
 
     # Log rows to "Challan"
-    created = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    created = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
     for d, q, r, a in items:
         row = [
-            company["company_name"],
-            created,
-            ch_dt,          # Invoice_Date column name kept as per your sheet
-            ch_no,
-            party_code,
-            party["name"],
-            party["gstin"],
-            d,
-            f"{q:.2f}",
-            f"{a:.2f}",
-            f"{a:.2f}",
-            f"{a:.2f}",
+            company["company_name"],  # Firm
+            created,                  # Createed_Date
+            ch_dt,                    # Invoice_Date (kept name)
+            ch_no,                    # Challan_Number
+            party_code,               # Supplier Code
+            party["name"],            # Supplier_Name
+            party["gstin"],           # Gst_No
+            d,                        # Description
+            f"{q:.2f}",               # Qty
+            f"{a:.2f}",               # Amount
+            f"{a:.2f}",               # Taxable_Amount
+            f"{a:.2f}",               # Grand_Total
         ]
         append_row_to_challan(row, supplier_challan_number=supplier_challan_number)
 
-    filename = _unique_name(f"Challan_{party['name'] or 'Party'}_{ch_no}.pdf")
-    return send_file(buf, as_attachment=True, download_name=filename, mimetype="application/pdf")
+    # Optional server copy
+    timestamp = datetime.now(IST).strftime("%Y%m%d-%H%M%S")
+    dl_name = f"Challan_{ch_no}_{(party['name'] or 'Party').strip().replace(' ','_')}_{timestamp}.pdf"
+    _save_copy("challan", company["company_name"], dl_name, data)
+
+    return send_file(io.BytesIO(data), as_attachment=True, download_name=_unique_name(dl_name), mimetype="application/pdf")
 
 # ---------- Invoice ----------
 @app.route("/invoice", methods=["GET","POST"])
@@ -1182,7 +1277,7 @@ def invoice():
         return render_template("invoice.html",
                                firms=firms, suppliers=suppliers, challans=challans,
                                next_no=get_next_invoice_number(),
-                               today=datetime.now().strftime("%d/%m/%Y"),
+                               today=datetime.now(IST).strftime("%d/%m/%Y"),
                                sac_default=SAC_DEFAULT,
                                gst_total=GST_TOTAL,
                                INV_MAX_ROWS=INV_MAX_ROWS,
@@ -1202,7 +1297,7 @@ def invoice():
     }
 
     inv_no = request.form.get("invoice_no") or "XXX"
-    inv_dt = request.form.get("invoice_date") or datetime.now().strftime("%d/%m/%Y")
+    inv_dt = request.form.get("invoice_date") or datetime.now(IST).strftime("%d/%m/%Y")
     discount = float(request.form.get("discount","0") or 0)
     sac_global = request.form.get("sac_global", SAC_DEFAULT).strip() or SAC_DEFAULT
 
@@ -1227,10 +1322,10 @@ def invoice():
 
     buf = io.BytesIO()
     draw_invoice_pdf(buf, company, sup, {"no":inv_no, "date":inv_dt}, items[:INV_MAX_ROWS], discount)
-    buf.seek(0)
+    data = buf.getvalue()
 
-    # Log row-per-item to "Invoice" (18 cols with separate Challan_Number + Description)
-    created = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Log row-per-item to "Invoice"
+    created = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
     sub_total = sum(i[5] for i in items)
     gross_all = max(sub_total - discount, 0.0)
     cgst_all  = gross_all * (CGST_RATE/100.0)
@@ -1271,8 +1366,12 @@ def invoice():
     # write back MTR to Challan rows (INVOICE_MTR)
     write_invoice_mtr_to_challan(company["company_name"], sup_code, items)
 
-    filename = _unique_name(f"Invoice_{sup['name'] or 'Supplier'}_{inv_no}.pdf")
-    return send_file(buf, as_attachment=True, download_name=filename, mimetype="application/pdf")
+    # Optional server copy
+    timestamp = datetime.now(IST).strftime("%Y%m%d-%H%M%S")
+    dl_name = f"Invoice_{inv_no}_{(sup['name'] or 'Supplier').strip().replace(' ','_')}_{timestamp}.pdf"
+    _save_copy("invoice", company["company_name"], dl_name, data)
+
+    return send_file(io.BytesIO(data), as_attachment=True, download_name=_unique_name(dl_name), mimetype="application/pdf")
 
 # ==============================
 # Main
