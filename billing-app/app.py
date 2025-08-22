@@ -551,7 +551,7 @@ def draw_challan_pdf(buf, company, party, meta, items):
         for ln in _wrap(f"Address: {company['addr']}", inner_w - (LOGO_MAX_W + LOGO_TEXT_PAD)):
             c.drawString(L+8, ay, ln); ay -= 12
         c.drawString(L+8, ay, f"Mobile: {company['mobile']}   |   GST No.: {company['gst']}")
-        _draw_logo(c, company.get("logo"), x_right=R-10, y_top=y-8, max_w=LOGO_MAX_W, max_h=LOGO_MAX_H)
+        _draw_logo(c, company.get("logo"), x_right=R-10, y_top=y-6, max_w=LOGO_MAX_W, max_h=LOGO_MAX_H)
 
         y = ay - 24
 
@@ -658,7 +658,7 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
     for ln in _wrap(f"Address: {company['addr']}", inner_w - (LOGO_MAX_W + LOGO_TEXT_PAD)):
         c.drawString(L+10, ay, ln); ay -= 12
     c.drawString(L+10, ay, f"Mobile: {company['mobile']}   |   GST No.: {company['gst']}")
-    _draw_logo(c, company.get("logo"), x_right=R-10, y_top=y-8, max_w=LOGO_MAX_W, max_h=LOGO_MAX_H)
+    _draw_logo(c, company.get("logo"), x_right=R-10, y_top=y-6, max_w=LOGO_MAX_W, max_h=LOGO_MAX_H)
     y = ay - 24
 
     part_h = 130
@@ -1459,3 +1459,4 @@ def invoice():
 # ==============================
 if __name__ == "__main__":
   app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=True)
+
