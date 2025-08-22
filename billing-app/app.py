@@ -658,7 +658,7 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
     for ln in _wrap(f"Address: {company['addr']}", inner_w - (LOGO_MAX_W + LOGO_TEXT_PAD)):
         c.drawString(L+10, ay, ln); ay -= 12
     c.drawString(L+10, ay, f"Mobile: {company['mobile']}   |   GST No.: {company['gst']}")
-    _draw_logo(c, company.get("logo"), x_right=R-10, y_top=y+1,  max_w=160, max_h=50)
+    _draw_logo(c, company.get("logo"), x_right=R-10, y_top=y-2,  max_w=160, max_h=50)
     y = ay - 24
 
     part_h = 130
@@ -1459,6 +1459,7 @@ def invoice():
 # ==============================
 if __name__ == "__main__":
   app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=True)
+
 
 
 
