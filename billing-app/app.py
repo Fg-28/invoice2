@@ -63,8 +63,8 @@ CH_MAX_ROWS  = 5
 IST = ZoneInfo("Asia/Kolkata")
 
 # ----- Logo sizing (PDF points; 72 pt = 1 inch)
-LOGO_MAX_W   = int(os.getenv("LOGO_MAX_W", "220"))  # was 140
-LOGO_MAX_H   = int(os.getenv("LOGO_MAX_H", "70"))   # was 46
+LOGO_MAX_W   = int(os.getenv("LOGO_MAX_W", "160"))  # was 140
+LOGO_MAX_H   = int(os.getenv("LOGO_MAX_H", "448"))   # was 46
 LOGO_TEXT_PAD= int(os.getenv("LOGO_TEXT_PAD", "20"))
 
 # ====== NEW: Firm-info strip background ======
@@ -1214,7 +1214,7 @@ function addFromChallan(){
       rate = String(r['Rate']);
     } else {
       const unitMaybe = safeNum(r['Amount']);          // we log unit rate into Amount
-      const totalMaybe= safeNum(r['Taxable_Amount']);  # we log total (qty*rate)
+      const totalMaybe= safeNum(r['Taxable_Amount']);  
       if (qn > 0 && unitMaybe > 0 && Math.abs((unitMaybe * qn) - totalMaybe) < 0.01) {
         rate = unitMaybe.toFixed(2);
       } else if (qn > 0 && totalMaybe > 0) {
@@ -1492,3 +1492,4 @@ def invoice():
 # ==============================
 if __name__ == "__main__":
   app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=True)
+
