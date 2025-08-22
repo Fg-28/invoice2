@@ -64,7 +64,7 @@ IST = ZoneInfo("Asia/Kolkata")
 
 # ----- Logo sizing (PDF points; 72 pt = 1 inch)
 LOGO_MAX_W   = int(os.getenv("LOGO_MAX_W", "160"))  # was 140
-LOGO_MAX_H   = int(os.getenv("LOGO_MAX_H", "448"))   # was 46
+LOGO_MAX_H   = int(os.getenv("LOGO_MAX_H", "48"))   # was 46
 LOGO_TEXT_PAD= int(os.getenv("LOGO_TEXT_PAD", "20"))
 
 # ====== NEW: Firm-info strip background ======
@@ -1492,4 +1492,5 @@ def invoice():
 # ==============================
 if __name__ == "__main__":
   app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=True)
+
 
