@@ -6,6 +6,8 @@
 # - Challan: 2 copies per page, 5 rows, logs to "Challan"
 # - Invoice: GST @ env GST_TOTAL (default 5%), global SAC, logs to "Invoice"
 # - Firms from "ID" tab, Suppliers from "Supplier" tab
+# - NEW: Cream background behind firm info on Challan & Invoice
+#        configurable via env FIRM_BG_HEX (default "#F5F2E6") and FIRM_BOX_H
 #
 # pip install: flask gspread google-auth reportlab gunicorn requests
 
@@ -64,6 +66,24 @@ IST = ZoneInfo("Asia/Kolkata")
 LOGO_MAX_W   = int(os.getenv("LOGO_MAX_W", "220"))  # was 140
 LOGO_MAX_H   = int(os.getenv("LOGO_MAX_H", "70"))   # was 46
 LOGO_TEXT_PAD= int(os.getenv("LOGO_TEXT_PAD", "20"))
+
+# ====== NEW: Firm-info strip background ======
+# Default to the requested cream: #F5F2E6 (RGB 245,242,230)
+FIRM_BG_HEX = os.getenv("FIRM_BG_HEX", "#F5F2E6")
+FIRM_BOX_H  = int(os.getenv("FIRM_BOX_H", "54"))  # height of the strip behind firm info
+
+def _hex_to_rgb01(h, fallback=(245, 242, 230)):
+    try:
+        s = h.strip().lstrip('#')
+        if len(s) == 3:
+            s = ''.join(ch*2 for ch in s)
+        r = int(s[0:2], 16); g = int(s[2:4], 16); b = int(s[4:6], 16)
+        return (r/255.0, g/255.0, b/255.0)
+    except Exception:
+        r, g, b = fallback
+        return (r/255.0, g/255.0, b/255.0)
+
+FIRM_BG_RGB = _hex_to_rgb01(FIRM_BG_HEX)
 
 # Optional overrides for logos (by UPPERCASE firm name)
 # You can override via env:
@@ -543,6 +563,12 @@ def draw_challan_pdf(buf, company, party, meta, items):
         c.drawCentredString((L+R)/2, T-22+5, company["title_name"])
 
         y = T-22-6
+
+        # ===== NEW: cream background behind firm info (name/address/GST) =====
+        c.setFillColorRGB(*FIRM_BG_RGB)
+        c.rect(L+1, y-FIRM_BOX_H, R-L-2, FIRM_BOX_H, fill=1, stroke=1)
+        c.setFillColor(colors.black)
+
         c.setFont("Helvetica-Bold", 11)
         c.drawString(L+8, y-14, f"DELIVERY CHALLAN - {company['title_name']}")
         c.setFont("Helvetica", 9)
@@ -649,7 +675,14 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
     c.drawCentredString((L+R)/2, T-band_h+6, company["title_name"])
 
     y = T-band_h-8
-    c.rect(L+1, y-54, R-L-2, 54)
+
+    # ===== NEW: cream background behind firm info (name/address/GST) =====
+    c.setFillColorRGB(*FIRM_BG_RGB)
+    c.rect(L+1, y-FIRM_BOX_H, R-L-2, FIRM_BOX_H, fill=1, stroke=1)
+    c.setFillColor(colors.black)
+
+    c.rect(L+1, y-54, R-L-2, 0)  # keep border alignment (no visible effect)
+
     c.setFont("Helvetica-Bold", 12)
     c.drawString(L+10, y-16, f"TAX INVOICE - {company['title_name']}")
     c.setFont("Helvetica", 9)
@@ -1181,7 +1214,7 @@ function addFromChallan(){
       rate = String(r['Rate']);
     } else {
       const unitMaybe = safeNum(r['Amount']);          // we log unit rate into Amount
-      const totalMaybe= safeNum(r['Taxable_Amount']);  // we log total (qty*rate)
+      const totalMaybe= safeNum(r['Taxable_Amount']);  # we log total (qty*rate)
       if (qn > 0 && unitMaybe > 0 && Math.abs((unitMaybe * qn) - totalMaybe) < 0.01) {
         rate = unitMaybe.toFixed(2);
       } else if (qn > 0 && totalMaybe > 0) {
@@ -1459,11 +1492,3 @@ def invoice():
 # ==============================
 if __name__ == "__main__":
   app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=True)
-
-
-
-
-
-
-
-
