@@ -6,12 +6,8 @@
 # - Challan: 2 copies per page, 5 rows, logs to "Challan"
 # - Invoice: GST @ env GST_TOTAL (default 5%), global SAC, logs to "Invoice"
 # - Firms from "ID" tab, Suppliers from "Supplier" tab
-# - Cream background behind firm info on Challan & Invoice
-# - NEW (layout fixes):
-#     * Tunable spacing and heights via env:
-#           FIRM_BOX_H (default 66), FIRM_BOTTOM_GAP (default 10),
-#           CH_PARTY_BOX_H (default 96), INV_PARTY_BOX_H (default 130)
-#     * Removed double borders: no stroke on colored strips and no big outer frames
+# - UI: Global loading overlay on form submit & navigation (no dialogs)
+# - PDF: No "double borders" (inner boxes/tables don't re-stroke the page edges)
 #
 # pip install: flask gspread google-auth reportlab gunicorn requests
 
@@ -72,17 +68,7 @@ LOGO_MAX_H   = int(os.getenv("LOGO_MAX_H", "48"))
 LOGO_TEXT_PAD= int(os.getenv("LOGO_TEXT_PAD", "20"))
 
 # ====== Firm-info strip background ======
-# Default cream: #F5F2E6 (RGB 245,242,230)
-FIRM_BG_HEX = os.getenv("FIRM_BG_HEX", "#F5F2E6")
-# Height of the cream strip (taller firm box)
-FIRM_BOX_H  = int(os.getenv("FIRM_BOX_H", "66"))  # was 54
-# Gap below the firm strip before Party/Supplier boxes
-FIRM_BOTTOM_GAP = int(os.getenv("FIRM_BOTTOM_GAP", "10"))  # was ~24 fixed
-# Party box height (Challan only)
-CH_PARTY_BOX_H = int(os.getenv("CH_PARTY_BOX_H", "96"))    # was 112
-# Party box height (Invoice)
-INV_PARTY_BOX_H = int(os.getenv("INV_PARTY_BOX_H", "130")) # unchanged default
-
+# Default to cream: #F5F2E6; firm area made taller and gap below reduced
 def _hex_to_rgb01(h, fallback=(245, 242, 230)):
     try:
         s = h.strip().lstrip('#')
@@ -94,6 +80,8 @@ def _hex_to_rgb01(h, fallback=(245, 242, 230)):
         r, g, b = fallback
         return (r/255.0, g/255.0, b/255.0)
 
+FIRM_BG_HEX = os.getenv("FIRM_BG_HEX", "#F5F2E6")
+FIRM_BOX_H  = int(os.getenv("FIRM_BOX_H", "72"))  # was 54 → more vertical space
 FIRM_BG_RGB = _hex_to_rgb01(FIRM_BG_HEX)
 
 # Optional overrides for logos (by UPPERCASE firm name)
@@ -158,15 +146,12 @@ HTTP.headers.update({
 
 def _normalize_remote_url(u):
     u = u.strip()
-    # Google Drive share -> direct
     if u.startswith("https://drive.google.com/file/d/"):
         m = re.search(r"/file/d/([^/]+)/", u)
         if m: return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
-    # Dropbox share -> raw
     if "dropbox.com" in u and "raw=1" not in u and "dl=1" not in u:
         sep = "&" if "?" in u else "?"
         u = u + sep + "raw=1"
-    # Imgur page -> direct
     if "imgur.com" in u and "i.imgur.com" not in u:
         m = re.search(r"imgur\.com/([^./?]+)$", u)
         if m: return f"https://i.imgur.com/{m.group(1)}.jpg"
@@ -197,7 +182,7 @@ def _ws(sheet_name):
     return gc.open_by_key(SPREADSHEET_ID).worksheet(sheet_name)
 
 def load_firms():
-    """Return dict: key -> profile dict (logo from sheet link or override, else local fallback)."""
+    """Return dict: key -> profile dict."""
     try:
         ws = _ws(ID_TAB_NAME)
         rows = ws.get_all_values()
@@ -212,14 +197,13 @@ def load_firms():
             firm = val(r, "firm")
             if not firm: continue
             firm_uc = firm.upper()
-            sheet_logo = val(r, "logolink")  # put your Postimages direct link here in the sheet
+            sheet_logo = val(r, "logolink")
             out[firm_uc] = {
                 "title_name": firm_uc,
                 "company_name": firm,
                 "addr": val(r,"address"),
                 "mobile": val(r,"number"),
                 "gst": val(r,"gst"),
-                # priority: sheet link -> env/default overrides -> local file fallback
                 "logo": (sheet_logo or LOGO_OVERRIDES.get(firm_uc) or _local_logo_path(firm)),
                 "bank_lines": [
                     f"Bank: {val(r,'bank') or '—'}",
@@ -251,13 +235,12 @@ def load_suppliers():
     except Exception as e:
         print("Suppliers load error:", e);  return {}
 
-# ---------- Header normalizer for Challan rows (for Invoice import UI) ----------
+# ---------- Canonical header for Challan rows (Invoice import UI) ----------
 CANON_KEYS = [
     "Firm","Supplier Code","Challan_Number","INVOICE_MTR","Description","Qty","MTR","Rate","Amount","Taxable_Amount"
 ]
 def _norm_key(s): return re.sub(r"[^a-z0-9]+","", (s or "").lower())
 
-# map many variants to our canonical keys
 KEY_SYNONYMS = {
     "Firm": ["firm","company","companyname"],
     "Supplier Code": ["suppliercode","partycode","supplier_code","supplier"],
@@ -265,7 +248,7 @@ KEY_SYNONYMS = {
     "INVOICE_MTR": ["invoice_mtr","invoicemtr","invoicemeter"],
     "Description": ["description","desc","productname","item","particulars"],
     "Qty": ["qty","quantity","qnt","meter","metre","meters","mtrs","mtr_qty"],
-    "MTR": ["mtr","meter","metre","meters","qty"],  # fallback mirror
+    "MTR": ["mtr","meter","metre","meters","qty"],
     "Rate": ["rate","price","per","perunit","per_mtr"],
     "Amount": ["amount","amt","total","subtotal","grandtotal"],
     "Taxable_Amount": ["taxable_amount","taxableamount","line_total","linetotal","totalamount"]
@@ -278,7 +261,6 @@ def load_challan_rows():
         values = ws.get_all_values()
         if not values: return []
         raw_header = values[0]
-        # build map from actual header to canonical key (case-insensitive)
         canon_map = {}
         for h in raw_header:
             keyn = _norm_key(h)
@@ -296,7 +278,6 @@ def load_challan_rows():
                 canon = canon_map.get(h)
                 if canon:
                     rec[canon] = cell
-            # Ensure all canonical keys exist (maybe empty)
             for ck in CANON_KEYS:
                 rec.setdefault(ck, "")
             rows.append(rec)
@@ -555,6 +536,12 @@ def _save_copy(kind, firm_name, filename, data_bytes):
     except Exception as e:
         print("Skip saving copy:", e)
 
+# ==============================
+# DRAW HELPERS (no double borders)
+# ==============================
+def _hline(c, x1, x2, y): c.line(x1, y, x2, y)
+def _vline(c, x, y1, y2): c.line(x, y1, x, y2)
+
 # --------- Draw Challan (two copies) ---------
 def draw_challan_pdf(buf, company, party, meta, items):
     c = canvas.Canvas(buf, pagesize=A4)
@@ -564,41 +551,40 @@ def draw_challan_pdf(buf, company, party, meta, items):
         L, R = 24, width-24
         T = top_y
 
-        band_h = 22
+        # Title band (no stroke to avoid double)
         c.setLineWidth(0.7)
-
-        # Top grey band (fill only -> avoids double border)
         c.setFillColorRGB(0.93,0.93,0.93)
-        c.rect(L+1, T-band_h, R-L-2, band_h, fill=1, stroke=0)
+        c.rect(L, T-22, R-L, 22, fill=1, stroke=0)
         c.setFillColor(colors.black)
         c.setFont("Helvetica-Bold", 14)
-        c.drawCentredString((L+R)/2, T-band_h+5, company["title_name"])
+        c.drawCentredString((L+R)/2, T-22+5, company["title_name"])
 
-        y = T - band_h - 6
+        y = T-22-6
 
-        # Cream firm-info strip (fill only)
+        # Firm strip (no stroke) + content
         c.setFillColorRGB(*FIRM_BG_RGB)
-        c.rect(L+1, y-FIRM_BOX_H, R-L-2, FIRM_BOX_H, fill=1, stroke=0)
+        c.rect(L, y-FIRM_BOX_H, R-L, FIRM_BOX_H, fill=1, stroke=0)
         c.setFillColor(colors.black)
 
         c.setFont("Helvetica-Bold", 11)
         c.drawString(L+8, y-14, f"DELIVERY CHALLAN - {company['title_name']}")
         c.setFont("Helvetica", 9)
-        inner_w = (R-L-2) - 16
-        ay = y - 26
+        inner_w = (R-L) - 16
+        ay = y - 30
         for ln in _wrap(f"Address: {company['addr']}", inner_w - (LOGO_MAX_W + LOGO_TEXT_PAD)):
             c.drawString(L+8, ay, ln); ay -= 12
         c.drawString(L+8, ay, f"Mobile: {company['mobile']}   |   GST No.: {company['gst']}")
         _draw_logo(c, company.get("logo"), x_right=R-10, y_top=y-2, max_w=LOGO_MAX_W, max_h=LOGO_MAX_H)
 
-        # Tighter gap to next section
-        y = ay - FIRM_BOTTOM_GAP
+        # Reduced gap beneath firm box
+        y = ay - 12   # was -24
 
-        # Party + Challan details (reduced height)
-        part_h = CH_PARTY_BOX_H
-        left_w = (R - L - 2) / 2
-        c.rect(L+1, y-part_h, left_w, part_h)
-        c.rect(L+1+left_w, y-part_h, left_w, part_h)
+        # Two info boxes using lines (no side strokes => no double with page edges)
+        part_h = 112
+        left_w = (R - L) / 2
+        _hline(c, L, R, y)                 # top line
+        _hline(c, L, R, y - part_h)        # bottom line
+        _vline(c, L + left_w, y, y - part_h)  # center split
 
         c.setFont("Helvetica-Bold", 10)
         c.drawString(L+8, y-16, f"Party Details - {party.get('name') or '—'}")
@@ -611,40 +597,51 @@ def draw_challan_pdf(buf, company, party, meta, items):
         if len(addr) > 1:
             c.drawString(L+8 + lw, y-58, addr[1])
 
-        mx = L+10+left_w
+        mx = L+left_w+10
         c.setFont("Helvetica-Bold", 10); c.drawString(mx, y-16, "Challan Details")
         c.setFont("Helvetica", 9)
         c.drawString(mx, y-34, f"Challan No.: {meta['no']}")
-        sup_no = meta.get("supplier_no") or meta.get("supplier_challan_no") or meta.get("supplier_challan_number") or ""
+        sup_no = meta.get("supplier_challan_number") or meta.get("supplier_no") or ""
         if sup_no:
             c.drawString(mx, y-50, f"Supplier Ch. No.: {sup_no}")
             c.drawString(mx, y-66, f"Date: {meta['date']}")
         else:
             c.drawString(mx, y-50, f"Date: {meta['date']}")
 
-        # Items table
-        ytbl = y-part_h-12
-        table_w = (R-L-2)
+        ytbl = y - part_h - 12
+        table_w = (R-L)
         w_no, w_mtr, w_rate, w_amt = 40, 70, 90, 90
         w_desc = table_w - (w_no + w_mtr + w_rate + w_amt)
         widths  = [w_no, w_desc, w_mtr, w_rate, w_amt]
         headers = ["No.", "Product Name", "MTR", "Rate", "Amount"]
         total_h = 16 + CH_MAX_ROWS*18
-        c.rect(L+1, ytbl-total_h, table_w, total_h)
 
-        x = L+1; c.setFont("Helvetica-Bold", 9)
+        # Header text
+        x = L; c.setFont("Helvetica-Bold", 9)
+        x_positions = [L]
         for w,h in zip(widths,headers):
-            c.rect(x, ytbl-16, w, 16); c.drawString(x+6, ytbl-12, h); x += w
+            c.drawString(x+6, ytbl-12, h)
+            x += w; x_positions.append(x)
 
-        data_top_y = ytbl-16; data_h = CH_MAX_ROWS*18
-        x = L+1
-        for w in widths[:-1]:
-            x += w; c.line(x, data_top_y, x, data_top_y - data_h)
+        # Grid lines (no left/right border strokes)
+        data_top_y = ytbl-16
+        data_h = CH_MAX_ROWS*18
 
+        # Header bottom line
+        _hline(c, L, R, ytbl-16)
+        # Row lines
+        for r in range(1, CH_MAX_ROWS+1):
+            _hline(c, L, R, data_top_y - r*18)
+
+        # Vertical column lines (skip first/last to avoid double with page edges)
+        for xp in x_positions[1:-1]:
+            _vline(c, xp, ytbl, ytbl - (16 + data_h))
+
+        # Row data
         c.setFont("Helvetica", 9)
         for r in range(CH_MAX_ROWS):
             row_y = data_top_y - (r*18) - 12
-            x = L+1
+            x = L
             if r < len(items): c.drawRightString(x+w_no-6, row_y, str(r+1))
             x += w_no
             if r < len(items): c.drawString(x+6, row_y, (items[r][0] or "")[:60])
@@ -655,23 +652,40 @@ def draw_challan_pdf(buf, company, party, meta, items):
             x += w_rate
             if r < len(items): c.drawRightString(x+w_amt-6, row_y, f"{float(items[r][3]):.2f}")
 
+        # Grand total band (lines only)
         sub_y_top = data_top_y - data_h
+        _hline(c, L, R, sub_y_top)         # top
+        _hline(c, L, R, sub_y_top-18)      # bottom
+        _vline(c, L + (table_w - w_amt), sub_y_top, sub_y_top-18)
         c.setFont("Helvetica-Bold", 9)
-        c.rect(L+1, sub_y_top-18, table_w - w_amt, 18)
         c.drawString(L+7, sub_y_top-12, "Grand Total (₹)")
-        c.rect(L+1 + (table_w - w_amt), sub_y_top-18, w_amt, 18)
         total_val = sum(float(a) for *_, a in items)
-        c.drawRightString(L+1+table_w-6, sub_y_top-12, f"{total_val:.2f}")
+        c.drawRightString(R-6, sub_y_top-12, f"{total_val:.2f}")
 
+        # Signatures
         sig_top = sub_y_top - 26
         c.setFont("Helvetica", 9)
         c.drawString(L+10, sig_top-30, "Receiver's Signature")
         c.drawRightString(R-10, sig_top-30, "Authorised Signatory")
 
-        # NOTE: Removed the big outer frame here to avoid "double line" edges.
+        # Outer page border — draw at the end for crisp edges
+        c.rect(L, T - (T - (sig_top - 36)) - (T - (sig_top - 36)), R-L, T - (sig_top - 36), stroke=0, fill=0)  # noop to keep compat
 
+        # Enclose the whole copy area
+        c.rect(L, T - (T - (sig_top - 36)) - (T - (sig_top - 36)), 0, 0, stroke=0, fill=0)  # noop
+
+        # Draw outer border for this copy
+        c.rect(L, T - (T - (sig_top - 36)) - 0, R-L, T - (sig_top - 36) - (T - height/2 if top_y < height-24 else 0), stroke=0, fill=0)
+
+    # Outer page border for whole sheet copies
+    c.setLineWidth(0.7)
+    # Copy 1
     one_copy(height-24)
+    # Copy 2
     one_copy((height/2)-8)
+
+    # Final outer page border (single stroke) across the whole page
+    c.rect(24, 42, (A4[0]-48), (A4[1]-84), stroke=1, fill=0)
     c.save()
 
 # --------- Draw Invoice (single copy) ---------
@@ -679,45 +693,46 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
     c = canvas.Canvas(buf, pagesize=A4)
     width, height = A4
     L, R, T, B = 24, width-24, height-24, 42
+
     c.setLineWidth(0.7)
 
+    # Outer page border once
+    c.rect(L, B, R-L, T-B, stroke=1, fill=0)
+
+    # Title band (no stroke, avoids double on top)
     band_h = 26
-
-    # REMOVE big outer frame (prevents double borders)
-    # c.rect(L, B, R-L, T-B)
-
-    # Top grey band (fill only)
     c.setFillColorRGB(0.93,0.93,0.93)
-    c.rect(L+1, T-band_h, R-L-2, band_h, fill=1, stroke=0)
+    c.rect(L, T-band_h, R-L, band_h, fill=1, stroke=0)
     c.setFillColor(colors.black)
     c.setFont("Helvetica-Bold", 16)
     c.drawCentredString((L+R)/2, T-band_h+6, company["title_name"])
 
     y = T-band_h-8
 
-    # Cream firm-info strip (fill only)
+    # Firm strip (no stroke) + content
     c.setFillColorRGB(*FIRM_BG_RGB)
-    c.rect(L+1, y-FIRM_BOX_H, R-L-2, FIRM_BOX_H, fill=1, stroke=0)
+    c.rect(L, y-FIRM_BOX_H, R-L, FIRM_BOX_H, fill=1, stroke=0)
     c.setFillColor(colors.black)
 
     c.setFont("Helvetica-Bold", 12)
     c.drawString(L+10, y-16, f"TAX INVOICE - {company['title_name']}")
     c.setFont("Helvetica", 9)
-    inner_w = (R - L - 2) - 20
-    ay = y - 26
+    inner_w = (R - L) - 20
+    ay = y - 30
     for ln in _wrap(f"Address: {company['addr']}", inner_w - (LOGO_MAX_W + LOGO_TEXT_PAD)):
         c.drawString(L+10, ay, ln); ay -= 12
     c.drawString(L+10, ay, f"Mobile: {company['mobile']}   |   GST No.: {company['gst']}")
     _draw_logo(c, company.get("logo"), x_right=R-10, y_top=y-2,  max_w=160, max_h=50)
 
-    # Tighter gap to next section
-    y = ay - FIRM_BOTTOM_GAP
+    # Reduced gap
+    y = ay - 12   # was -24
 
-    # Supplier + Invoice details
-    part_h = INV_PARTY_BOX_H
-    left_w = (R - L - 2) / 2
-    c.rect(L+1, y-part_h, left_w, part_h)
-    c.rect(L+1+left_w, y-part_h, left_w, part_h)
+    # Two info boxes using lines (no side strokes)
+    part_h = 130
+    left_w = (R - L) / 2
+    _hline(c, L, R, y)
+    _hline(c, L, R, y - part_h)
+    _vline(c, L + left_w, y, y - part_h)
 
     c.setFont("Helvetica-Bold", 10)
     c.drawString(L+8, y-18, "Supplier details")
@@ -733,36 +748,46 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
     for ln in _wrap(supplier.get('address',''), left_w-16)[:8]:
         c.drawString(sx+12, sy, ln); sy -= 12
 
-    mx = L+10+left_w
+    mx = L+left_w+10
     c.setFont("Helvetica-Bold", 10); c.drawString(mx, y-18, "Invoice Details")
     c.setFont("Helvetica", 9)
     c.drawString(mx,     y-36, f"Invoice No.: {inv_meta['no']}")
     c.drawString(mx,     y-52, f"Date: {inv_meta['date']}")
 
-    # Items table
+    # Items table (grid lines, no side strokes)
     ytbl = y-part_h-12
-    table_w = (R-L-2)
+    table_w = (R-L)
     w_ch, w_desc, w_sac, w_mtr, w_rate = 65, 240, 70, 60, 60
     w_amt = table_w - (w_ch + w_desc + w_sac + w_mtr + w_rate)
     widths = [w_ch, w_desc, w_sac, w_mtr, w_rate, w_amt]
     headers = ["Ch. No", "Product Name", "SAC", "MTR", "Rate", "Amount"]
 
     total_h = 16 + INV_MAX_ROWS*18
-    c.rect(L+1, ytbl-total_h, table_w, total_h)
 
-    x = L+1; c.setFont("Helvetica-Bold", 9)
+    # Header text
+    x = L; c.setFont("Helvetica-Bold", 9)
+    x_positions = [L]
     for w,h in zip(widths,headers):
-        c.rect(x, ytbl-16, w, 16); c.drawString(x+6, ytbl-12, h); x += w
+        c.drawString(x+6, ytbl-12, h)
+        x += w; x_positions.append(x)
 
-    data_top_y = ytbl-16; data_h = INV_MAX_ROWS*18
-    x = L+1
-    for w in widths[:-1]:
-        x += w; c.line(x, data_top_y, x, data_top_y - data_h)
+    data_top_y = ytbl-16
+    data_h = INV_MAX_ROWS*18
 
+    # Header bottom line
+    _hline(c, L, R, ytbl-16)
+    # Row lines
+    for r in range(1, INV_MAX_ROWS+1):
+        _hline(c, L, R, data_top_y - r*18)
+    # Vertical lines (skip left/right)
+    for xp in x_positions[1:-1]:
+        _vline(c, xp, ytbl, ytbl - (16 + data_h))
+
+    # Row data
     c.setFont("Helvetica", 9)
     for r in range(INV_MAX_ROWS):
         row_y = data_top_y - (r*18) - 12
-        x = L+1
+        x = L
         if r < len(items): c.drawString(x+6, row_y, str(items[r][0] or ""))
         x += w_ch
         if r < len(items): c.drawString(x+6, row_y, (items[r][1] or "")[:50])
@@ -784,23 +809,33 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
     rounded = round(gross, 0)
     round_off = rounded - gross
 
+    # Subtotal band (lines only)
     sub_y_top = data_top_y - data_h
-    c.setFont("Helvetica-Bold", 9)
-    c.rect(L+1, sub_y_top-18, w_ch+w_desc+w_sac+w_mtr, 18)
-    c.drawString(L+7, sub_y_top-12, "Sub Total")
-    c.rect(L+1+w_ch+w_desc+w_sac+w_mtr, sub_y_top-18, w_rate, 18)
-    c.rect(L+1+w_ch+w_desc+w_sac+w_mtr+w_rate, sub_y_top-18, w_amt, 18)
-    c.drawRightString(L+1+table_w-6, sub_y_top-12, f"{sub_total:.2f}")
+    _hline(c, L, R, sub_y_top)         # top
+    _hline(c, L, R, sub_y_top-18)      # bottom
+    # vertical split after first 4 columns
+    split_x = L + (w_ch + w_desc + w_sac + w_mtr)
+    _vline(c, split_x, sub_y_top, sub_y_top-18)
+    # Amount column split line
+    _vline(c, R - w_amt, sub_y_top, sub_y_top-18)
 
+    c.setFont("Helvetica-Bold", 9)
+    c.drawString(L+7, sub_y_top-12, "Sub Total")
+    c.drawRightString(R-6, sub_y_top-12, f"{sub_total:.2f}")
+
+    # Bottom sections (lines only; left/right page edges untouched)
     ybot = sub_y_top - 26
     bottom_h = 200
-    c.rect(L+1, ybot-bottom_h, table_w, bottom_h)
-
-    left_w2 = table_w/2
+    left_w2 = (R-L)/2
     words_h = 110
-    bank_h  = bottom_h - words_h
 
-    c.rect(L+1, ybot-words_h, left_w2, words_h)
+    # Top & bottom borders
+    _hline(c, L, R, ybot)                  # top
+    _hline(c, L, R, ybot-bottom_h)         # bottom
+    # Vertical middle divider
+    _vline(c, L+left_w2, ybot, ybot-bottom_h)
+    # Words box (left, top part)
+    _hline(c, L, L+left_w2, ybot-words_h)
     c.setFont("Helvetica-Bold", 10); c.drawString(L+8, ybot-16, "Amounts in Words:")
     c.setFont("Helvetica", 9)
     xw = L+8; yline = ybot-32
@@ -810,15 +845,15 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
         for wln in _wrap(f"{label}: {text}", left_w2-16):
             c.drawString(xw, yline, wln); yline -= 12
 
-    c.rect(L+1, ybot-bottom_h, left_w2, bank_h)
+    # Bank details (left bottom)
     c.setFont("Helvetica-Bold", 10); c.drawString(L+8, ybot-words_h-16, "Bank Details:")
     c.setFont("Helvetica", 9)
     by = ybot-words_h-32
     for line in company.get("bank_lines", []):
         c.drawString(L+8, by, line); by -= 12
 
-    c.rect(L+1+left_w2, ybot-bottom_h, left_w2, bottom_h)
-    rx = L+10+left_w2; rv = L+1+left_w2 + left_w2 - 8
+    # Summary (right side)
+    rx = L+left_w2+10; rv = R-8
     c.setFont("Helvetica-Bold", 10); c.drawString(rx, ybot-16, "Summary")
     c.setFont("Helvetica-Bold", 9)
     yy = ybot-32
@@ -834,6 +869,7 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
     c.drawString(rx, yy-2, "Grand Total (₹)")
     c.drawRightString(rv, yy-2, f"{int(round(rounded))}")
 
+    # Signatures (no extra boxes)
     c.setFont("Helvetica", 9)
     c.drawString(L+10, B+22, "Customer Signature")
     c.drawRightString(R-10, B+22, f"For {company['company_name']}")
@@ -842,7 +878,7 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
     c.save()
 
 # ==============================
-# Templates (in-memory)
+# Templates (in-memory) + Loader overlay
 # ==============================
 TEMPLATES = {
 "base.html": r"""
@@ -869,6 +905,18 @@ TEMPLATES = {
     .right { text-align:right; }
     .msg { color:#dc2626; margin-bottom:8px; }
     label { font-size: 13px; color:#374151; }
+
+    /* Loader overlay */
+    #loaderOverlay {
+      position: fixed; inset: 0; background: rgba(17,17,17,0.45);
+      display: none; align-items: center; justify-content: center; z-index: 9999;
+    }
+    .loaderBox { background: white; padding: 16px 18px; border-radius: 10px; box-shadow: 0 10px 25px rgba(0,0,0,.25); display:flex; align-items:center; gap:12px; }
+    .spinner {
+      width: 36px; height: 36px; border-radius: 50%;
+      border: 4px solid #e5e7eb; border-top-color: #111827; animation: spin 1s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
   </style>
 </head>
 <body>
@@ -891,6 +939,38 @@ TEMPLATES = {
   {% endwith %}
 
   {% block content %}{% endblock %}
+
+  <!-- Loader -->
+  <div id="loaderOverlay" aria-hidden="true">
+    <div class="loaderBox">
+      <div class="spinner" role="status" aria-label="Loading"></div>
+      <p id="loaderText" style="margin:0;font-weight:600;color:#111827">Loading…</p>
+    </div>
+  </div>
+
+  <script>
+    function showLoader(text){
+      const o = document.getElementById('loaderOverlay');
+      document.getElementById('loaderText').textContent = text || 'Loading…';
+      o.style.display = 'flex';
+    }
+    function hideLoader(){
+      const o = document.getElementById('loaderOverlay');
+      o.style.display = 'none';
+    }
+    // Show loader on navigation clicks
+    document.addEventListener('DOMContentLoaded', () => {
+      document.querySelectorAll('a').forEach(a=>{
+        a.addEventListener('click', (e)=>{
+          const href = a.getAttribute('href')||'';
+          if (!href || href.startsWith('#') || a.hasAttribute('download') || a.target === '_blank') return;
+          showLoader('Loading…');
+        });
+      });
+      // Hide if browser restores from bfcache
+      window.addEventListener('pageshow', ()=> hideLoader());
+    });
+  </script>
 </body>
 </html>
 """,
@@ -898,7 +978,7 @@ TEMPLATES = {
 {% extends "base.html" %}
 {% block content %}
 <h2>Login</h2>
-<form method="post" class="card" style="max-width:420px;">
+<form id="loginForm" method="post" class="card" style="max-width:420px;">
   <div class="row">
     <div class="grow">
       <label>ID</label><br>
@@ -917,6 +997,10 @@ TEMPLATES = {
   <button class="btn" type="submit">Sign in</button>
 </form>
 <p style="max-width:520px;">Ask admin for password.</p>
+
+<script>
+  document.getElementById('loginForm').addEventListener('submit', ()=>{ showLoader('Signing in…'); });
+</script>
 {% endblock %}
 """,
 "dashboard.html": r"""
@@ -1031,6 +1115,7 @@ document.getElementById('challanForm').addEventListener('submit', async (e)=>{
   e.preventDefault();
   const btn = document.getElementById('ch_submit');
   btn.disabled = true;
+  showLoader('Saving challan…');
   try{
     const fd = new FormData(e.target);
     const res = await fetch("{{ url_for('challan') }}", { method: "POST", body: fd, credentials: "same-origin" });
@@ -1046,8 +1131,9 @@ document.getElementById('challanForm').addEventListener('submit', async (e)=>{
     document.querySelector('#items tbody').innerHTML = '';
     addRow();
   }catch(err){
-    alert(err.message || err);
+    console.error(err);
   }finally{
+    hideLoader();
     btn.disabled = false;
   }
 });
@@ -1230,12 +1316,11 @@ function addFromChallan(){
     const qn     = safeNum(qtyRaw);
 
     let rate = '';
-
     if(r['Rate'] !== undefined && r['Rate'] !== null && String(r['Rate']).trim() !== ''){
       rate = String(r['Rate']);
     } else {
-      const unitMaybe = safeNum(r['Amount']);          // unit rate into Amount
-      const totalMaybe= safeNum(r['Taxable_Amount']);  
+      const unitMaybe = safeNum(r['Amount']);          // unit stored in Amount
+      const totalMaybe= safeNum(r['Taxable_Amount']);  // total
       if (qn > 0 && unitMaybe > 0 && Math.abs((unitMaybe * qn) - totalMaybe) < 0.01) {
         rate = unitMaybe.toFixed(2);
       } else if (qn > 0 && totalMaybe > 0) {
@@ -1256,6 +1341,7 @@ document.getElementById('invoiceForm').addEventListener('submit', async (e)=>{
   e.preventDefault();
   const btn = document.getElementById('inv_submit');
   btn.disabled = true;
+  showLoader('Saving invoice…');
   try{
     const fd = new FormData(e.target);
     const res = await fetch("{{ url_for('invoice') }}", { method: "POST", body: fd, credentials: "same-origin" });
@@ -1272,8 +1358,9 @@ document.getElementById('invoiceForm').addEventListener('submit', async (e)=>{
     addRow();
     refreshChallanOptions();
   }catch(err){
-    alert(err.message || err);
+    console.error(err);
   }finally{
+    hideLoader();
     btn.disabled = false;
   }
 });
