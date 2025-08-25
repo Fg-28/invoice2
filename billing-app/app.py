@@ -585,7 +585,7 @@ def draw_challan_pdf(buf, company, party, meta, items):
         _draw_logo(c, company.get("logo"), x_right=R-12, y_top=y-4, max_w=LOGO_MAX_W, max_h=LOGO_MAX_H)
 
         # Gap after firm box (smaller)
-        y = ay - 10
+        y = ay - 20
 
         # Info area (two columns) – draw as one box with center divider
         part_h = 112
@@ -721,7 +721,7 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
     _draw_logo(c, company.get("logo"), x_right=R-12, y_top=y-4,  max_w=160, max_h=50)
 
     # Reduced gap
-    y = ay - 10
+    y = ay - 20
 
     # Two info boxes using lines (full width top/bottom + center divider)
     part_h = 130
@@ -1586,3 +1586,4 @@ def invoice():
 # ==============================
 if __name__ == "__main__":
   app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=True)
+
