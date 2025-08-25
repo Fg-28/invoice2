@@ -6,8 +6,12 @@
 # - Challan: 2 copies per page, 5 rows, logs to "Challan"
 # - Invoice: GST @ env GST_TOTAL (default 5%), global SAC, logs to "Invoice"
 # - Firms from "ID" tab, Suppliers from "Supplier" tab
-# - NEW: Cream background behind firm info on Challan & Invoice
-#        configurable via env FIRM_BG_HEX (default "#F5F2E6") and FIRM_BOX_H
+# - Cream background behind firm info on Challan & Invoice
+# - NEW (layout fixes):
+#     * Tunable spacing and heights via env:
+#           FIRM_BOX_H (default 66), FIRM_BOTTOM_GAP (default 10),
+#           CH_PARTY_BOX_H (default 96), INV_PARTY_BOX_H (default 130)
+#     * Removed double borders: no stroke on colored strips and no big outer frames
 #
 # pip install: flask gspread google-auth reportlab gunicorn requests
 
@@ -63,14 +67,21 @@ CH_MAX_ROWS  = 5
 IST = ZoneInfo("Asia/Kolkata")
 
 # ----- Logo sizing (PDF points; 72 pt = 1 inch)
-LOGO_MAX_W   = int(os.getenv("LOGO_MAX_W", "160"))  # was 140
-LOGO_MAX_H   = int(os.getenv("LOGO_MAX_H", "48"))   # was 46
+LOGO_MAX_W   = int(os.getenv("LOGO_MAX_W", "160"))
+LOGO_MAX_H   = int(os.getenv("LOGO_MAX_H", "48"))
 LOGO_TEXT_PAD= int(os.getenv("LOGO_TEXT_PAD", "20"))
 
-# ====== NEW: Firm-info strip background ======
-# Default to the requested cream: #F5F2E6 (RGB 245,242,230)
+# ====== Firm-info strip background ======
+# Default cream: #F5F2E6 (RGB 245,242,230)
 FIRM_BG_HEX = os.getenv("FIRM_BG_HEX", "#F5F2E6")
-FIRM_BOX_H  = int(os.getenv("FIRM_BOX_H", "54"))  # height of the strip behind firm info
+# Height of the cream strip (taller firm box)
+FIRM_BOX_H  = int(os.getenv("FIRM_BOX_H", "66"))  # was 54
+# Gap below the firm strip before Party/Supplier boxes
+FIRM_BOTTOM_GAP = int(os.getenv("FIRM_BOTTOM_GAP", "10"))  # was ~24 fixed
+# Party box height (Challan only)
+CH_PARTY_BOX_H = int(os.getenv("CH_PARTY_BOX_H", "96"))    # was 112
+# Party box height (Invoice)
+INV_PARTY_BOX_H = int(os.getenv("INV_PARTY_BOX_H", "130")) # unchanged default
 
 def _hex_to_rgb01(h, fallback=(245, 242, 230)):
     try:
@@ -86,8 +97,6 @@ def _hex_to_rgb01(h, fallback=(245, 242, 230)):
 FIRM_BG_RGB = _hex_to_rgb01(FIRM_BG_HEX)
 
 # Optional overrides for logos (by UPPERCASE firm name)
-# You can override via env:
-#   LOGO_OVERRIDES='{"JAY VALAM":"https://i.postimg.cc/Hn9f1HCy/jay-valam.jpg"}'
 LOGO_OVERRIDES_DEFAULT = {
     "JAY VALAM": "https://i.postimg.cc/Hn9f1HCy/jay-valam.jpg"
 }
@@ -555,33 +564,38 @@ def draw_challan_pdf(buf, company, party, meta, items):
         L, R = 24, width-24
         T = top_y
 
+        band_h = 22
         c.setLineWidth(0.7)
+
+        # Top grey band (fill only -> avoids double border)
         c.setFillColorRGB(0.93,0.93,0.93)
-        c.rect(L+1, T-22, R-L-2, 22, fill=1, stroke=1)
+        c.rect(L+1, T-band_h, R-L-2, band_h, fill=1, stroke=0)
         c.setFillColor(colors.black)
         c.setFont("Helvetica-Bold", 14)
-        c.drawCentredString((L+R)/2, T-22+5, company["title_name"])
+        c.drawCentredString((L+R)/2, T-band_h+5, company["title_name"])
 
-        y = T-22-6
+        y = T - band_h - 6
 
-        # ===== NEW: cream background behind firm info (name/address/GST) =====
+        # Cream firm-info strip (fill only)
         c.setFillColorRGB(*FIRM_BG_RGB)
-        c.rect(L+1, y-FIRM_BOX_H, R-L-2, FIRM_BOX_H, fill=1, stroke=1)
+        c.rect(L+1, y-FIRM_BOX_H, R-L-2, FIRM_BOX_H, fill=1, stroke=0)
         c.setFillColor(colors.black)
 
         c.setFont("Helvetica-Bold", 11)
         c.drawString(L+8, y-14, f"DELIVERY CHALLAN - {company['title_name']}")
         c.setFont("Helvetica", 9)
         inner_w = (R-L-2) - 16
-        ay = y - 30
+        ay = y - 26
         for ln in _wrap(f"Address: {company['addr']}", inner_w - (LOGO_MAX_W + LOGO_TEXT_PAD)):
             c.drawString(L+8, ay, ln); ay -= 12
         c.drawString(L+8, ay, f"Mobile: {company['mobile']}   |   GST No.: {company['gst']}")
         _draw_logo(c, company.get("logo"), x_right=R-10, y_top=y-2, max_w=LOGO_MAX_W, max_h=LOGO_MAX_H)
 
-        y = ay - 24
+        # Tighter gap to next section
+        y = ay - FIRM_BOTTOM_GAP
 
-        part_h = 112
+        # Party + Challan details (reduced height)
+        part_h = CH_PARTY_BOX_H
         left_w = (R - L - 2) / 2
         c.rect(L+1, y-part_h, left_w, part_h)
         c.rect(L+1+left_w, y-part_h, left_w, part_h)
@@ -608,6 +622,7 @@ def draw_challan_pdf(buf, company, party, meta, items):
         else:
             c.drawString(mx, y-50, f"Date: {meta['date']}")
 
+        # Items table
         ytbl = y-part_h-12
         table_w = (R-L-2)
         w_no, w_mtr, w_rate, w_amt = 40, 70, 90, 90
@@ -653,8 +668,7 @@ def draw_challan_pdf(buf, company, party, meta, items):
         c.drawString(L+10, sig_top-30, "Receiver's Signature")
         c.drawRightString(R-10, sig_top-30, "Authorised Signatory")
 
-        bottom_y = sig_top - 36
-        c.rect(L, bottom_y, R-L, T - bottom_y)
+        # NOTE: Removed the big outer frame here to avoid "double line" edges.
 
     one_copy(height-24)
     one_copy((height/2)-8)
@@ -665,36 +679,42 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
     c = canvas.Canvas(buf, pagesize=A4)
     width, height = A4
     L, R, T, B = 24, width-24, height-24, 42
-    c.setLineWidth(0.7); c.rect(L, B, R-L, T-B)
+    c.setLineWidth(0.7)
 
     band_h = 26
+
+    # REMOVE big outer frame (prevents double borders)
+    # c.rect(L, B, R-L, T-B)
+
+    # Top grey band (fill only)
     c.setFillColorRGB(0.93,0.93,0.93)
-    c.rect(L+1, T-band_h, R-L-2, band_h, fill=1, stroke=1)
+    c.rect(L+1, T-band_h, R-L-2, band_h, fill=1, stroke=0)
     c.setFillColor(colors.black)
     c.setFont("Helvetica-Bold", 16)
     c.drawCentredString((L+R)/2, T-band_h+6, company["title_name"])
 
     y = T-band_h-8
 
-    # ===== NEW: cream background behind firm info (name/address/GST) =====
+    # Cream firm-info strip (fill only)
     c.setFillColorRGB(*FIRM_BG_RGB)
-    c.rect(L+1, y-FIRM_BOX_H, R-L-2, FIRM_BOX_H, fill=1, stroke=1)
+    c.rect(L+1, y-FIRM_BOX_H, R-L-2, FIRM_BOX_H, fill=1, stroke=0)
     c.setFillColor(colors.black)
-
-    c.rect(L+1, y-54, R-L-2, 0)  # keep border alignment (no visible effect)
 
     c.setFont("Helvetica-Bold", 12)
     c.drawString(L+10, y-16, f"TAX INVOICE - {company['title_name']}")
     c.setFont("Helvetica", 9)
     inner_w = (R - L - 2) - 20
-    ay = y - 30
+    ay = y - 26
     for ln in _wrap(f"Address: {company['addr']}", inner_w - (LOGO_MAX_W + LOGO_TEXT_PAD)):
         c.drawString(L+10, ay, ln); ay -= 12
     c.drawString(L+10, ay, f"Mobile: {company['mobile']}   |   GST No.: {company['gst']}")
     _draw_logo(c, company.get("logo"), x_right=R-10, y_top=y-2,  max_w=160, max_h=50)
-    y = ay - 24
 
-    part_h = 130
+    # Tighter gap to next section
+    y = ay - FIRM_BOTTOM_GAP
+
+    # Supplier + Invoice details
+    part_h = INV_PARTY_BOX_H
     left_w = (R - L - 2) / 2
     c.rect(L+1, y-part_h, left_w, part_h)
     c.rect(L+1+left_w, y-part_h, left_w, part_h)
@@ -719,6 +739,7 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
     c.drawString(mx,     y-36, f"Invoice No.: {inv_meta['no']}")
     c.drawString(mx,     y-52, f"Date: {inv_meta['date']}")
 
+    # Items table
     ytbl = y-part_h-12
     table_w = (R-L-2)
     w_ch, w_desc, w_sac, w_mtr, w_rate = 65, 240, 70, 60, 60
@@ -1213,7 +1234,7 @@ function addFromChallan(){
     if(r['Rate'] !== undefined && r['Rate'] !== null && String(r['Rate']).trim() !== ''){
       rate = String(r['Rate']);
     } else {
-      const unitMaybe = safeNum(r['Amount']);          // we log unit rate into Amount
+      const unitMaybe = safeNum(r['Amount']);          // unit rate into Amount
       const totalMaybe= safeNum(r['Taxable_Amount']);  
       if (qn > 0 && unitMaybe > 0 && Math.abs((unitMaybe * qn) - totalMaybe) < 0.01) {
         rate = unitMaybe.toFixed(2);
@@ -1492,7 +1513,3 @@ def invoice():
 # ==============================
 if __name__ == "__main__":
   app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=True)
-
-
-
-
