@@ -588,7 +588,7 @@ def draw_challan_pdf(buf, company, party, meta, items):
         y = ay - 20
 
         # Info area (two columns) – draw as one box with center divider
-        part_h = 112
+        part_h = 90
         _hline(c, L+1, R-1, y)                 # top
         _hline(c, L+1, R-1, y - part_h)        # bottom
         _vline(c, (L+R)/2, y, y - part_h)      # center
@@ -616,7 +616,7 @@ def draw_challan_pdf(buf, company, party, meta, items):
             c.drawString(mx, y-50, f"Date: {meta['date']}")
 
         # Items table (no horizontal row lines)
-        ytbl = y - part_h - 12
+        ytbl = y - part_h
         table_w = (R-L)
         w_no, w_mtr, w_rate, w_amt = 40, 70, 90, 90
         w_desc = table_w - (w_no + w_mtr + w_rate + w_amt)
@@ -724,7 +724,7 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
     y = ay - 20
 
     # Two info boxes using lines (full width top/bottom + center divider)
-    part_h = 130
+    part_h = 110
     _hline(c, L+1, R-1, y)
     _hline(c, L+1, R-1, y - part_h)
     _vline(c, (L+R)/2, y, y - part_h)
@@ -750,7 +750,7 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
     c.drawString(mx,     y-52, f"Date: {inv_meta['date']}")
 
     # Items table (no horizontal row lines)
-    ytbl = y-part_h-12
+    ytbl = y-part_h
     table_w = (R-L)
     w_ch, w_desc, w_sac, w_mtr, w_rate = 65, 240, 70, 60, 60
     w_amt = table_w - (w_ch + w_desc + w_sac + w_mtr + w_rate)
@@ -1586,4 +1586,5 @@ def invoice():
 # ==============================
 if __name__ == "__main__":
   app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=True)
+
 
