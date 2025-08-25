@@ -8,9 +8,9 @@
 # - Firms from "ID" tab, Suppliers from "Supplier" tab
 # - UI: Global loading overlay on form submit & navigation (no dialogs)
 # - PDF:
-#     * Header + firm-info boxes have fill + borders (no overlap)
+#     * Header + firm-info boxes are fill-only with separator lines (no double-edge)
 #     * For CHALLAN, two separate outer borders (one per copy)
-#     * Signatures are inside the border
+#     * Signatures are inside the border; offset adjustable
 #     * No horizontal row lines in items tables
 #
 # pip install: flask gspread google-auth reportlab gunicorn requests
@@ -86,6 +86,9 @@ def _hex_to_rgb01(h, fallback=(245, 242, 230)):
 FIRM_BG_HEX = os.getenv("FIRM_BG_HEX", "#F5F2E6")
 FIRM_BOX_H  = int(os.getenv("FIRM_BOX_H", "72"))  # taller firm area by default
 FIRM_BG_RGB = _hex_to_rgb01(FIRM_BG_HEX)
+
+# Signature vertical offset from bottom of each challan copy (lower number = closer to bottom)
+CHALLAN_SIG_OFFSET = int(os.getenv("CHALLAN_SIG_OFFSET", "14"))
 
 # Optional overrides for logos (by UPPERCASE firm name)
 LOGO_OVERRIDES_DEFAULT = {
@@ -554,25 +557,28 @@ def draw_challan_pdf(buf, company, party, meta, items):
     page_bottom = 42
     copy_gap = 16
     copy_h = (page_top - page_bottom - copy_gap) / 2
+    c.setLineWidth(0.7)
 
     def one_copy(T, B):
         # Outer border for this copy
-        c.setLineWidth(0.7)
         c.rect(L, B, R-L, T-B, stroke=1, fill=0)
 
-        # Title band (light grey) with bottom border
+        # Title band (light grey) — FILL ONLY, then bottom separator
         title_h = 22
         c.setFillColorRGB(0.93,0.93,0.93)
-        c.rect(L+1, T-title_h-1, R-L-2, title_h, fill=1, stroke=1)  # inset 1pt to avoid outer overlap
+        c.rect(L+1, T-title_h-1, R-L-2, title_h, fill=1, stroke=0)
         c.setFillColor(colors.black)
         c.setFont("Helvetica-Bold", 14)
         c.drawCentredString((L+R)/2, T-title_h+5, company["title_name"])
+        _hline(c, L, R, T-title_h-1)
 
-        # Firm info box (cream) with its own border + reduced gap after
+        # Firm info strip (cream) — FILL ONLY, then top+bottom separators
         y = T - title_h - 6
         c.setFillColorRGB(*FIRM_BG_RGB)
-        c.rect(L+1, y-FIRM_BOX_H-2, R-L-2, FIRM_BOX_H, fill=1, stroke=1)
+        c.rect(L+1, y-FIRM_BOX_H-2, R-L-2, FIRM_BOX_H, fill=1, stroke=0)
         c.setFillColor(colors.black)
+        _hline(c, L, R, y-FIRM_BOX_H-2)
+        _hline(c, L, R, y-2)
 
         c.setFont("Helvetica-Bold", 11)
         c.drawString(L+10, y-14, f"DELIVERY CHALLAN - {company['title_name']}")
@@ -584,14 +590,14 @@ def draw_challan_pdf(buf, company, party, meta, items):
         c.drawString(L+10, ay, f"Mobile: {company['mobile']}   |   GST No.: {company['gst']}")
         _draw_logo(c, company.get("logo"), x_right=R-12, y_top=y-4, max_w=LOGO_MAX_W, max_h=LOGO_MAX_H)
 
-        # Gap after firm box (smaller)
+        # Gap after firm box
         y = ay - 20
 
-        # Info area (two columns) – draw as one box with center divider
+        # Two-column info area (single box with middle divider)
         part_h = 90
-        _hline(c, L+1, R-1, y)                 # top
-        _hline(c, L+1, R-1, y - part_h)        # bottom
-        _vline(c, (L+R)/2, y, y - part_h)      # center
+        _hline(c, L, R, y)                 # top edge
+        _hline(c, L, R, y - part_h)        # bottom edge
+        _vline(c, (L+R)/2, y, y - part_h)  # center divider
 
         c.setFont("Helvetica-Bold", 10)
         c.drawString(L+10, y-16, f"Party Details - {party.get('name') or '—'}")
@@ -623,25 +629,20 @@ def draw_challan_pdf(buf, company, party, meta, items):
         widths  = [w_no, w_desc, w_mtr, w_rate, w_amt]
         headers = ["No.", "Product Name", "MTR", "Rate", "Amount"]
 
-        # Header row + bottom grid line
         c.setFont("Helvetica-Bold", 9)
         x = L
         x_positions = [L]
         for w,h in zip(widths,headers):
             c.drawString(x+6, ytbl-12, h)
             x += w; x_positions.append(x)
-        # header underline
-        _hline(c, L, R, ytbl-16)
+        _hline(c, L, R, ytbl-16)  # underline header
 
-        # vertical column lines (no left/right extra strokes)
         data_top_y = ytbl-16
         data_h = CH_MAX_ROWS*18
         for xp in x_positions[1:-1]:
             _vline(c, xp, ytbl, ytbl - (16 + data_h))
-        # table bottom
-        _hline(c, L, R, data_top_y - data_h)
+        _hline(c, L, R, data_top_y - data_h)  # bottom
 
-        # Row data (no internal horizontal lines)
         c.setFont("Helvetica", 9)
         for r in range(CH_MAX_ROWS):
             row_y = data_top_y - (r*18) - 12
@@ -658,26 +659,25 @@ def draw_challan_pdf(buf, company, party, meta, items):
 
         # Grand total band (lines only)
         sub_y_top = data_top_y - data_h
-        _hline(c, L+1, R-1, sub_y_top)         # top
-        _hline(c, L+1, R-1, sub_y_top-18)      # bottom
+        _hline(c, L, R, sub_y_top)
+        _hline(c, L, R, sub_y_top-18)
         _vline(c, L + (table_w - w_amt), sub_y_top, sub_y_top-18)
         c.setFont("Helvetica-Bold", 9)
         c.drawString(L+7, sub_y_top-12, "Grand Total (₹)")
         total_val = sum(float(a) for *_, a in items)
         c.drawRightString(R-6, sub_y_top-12, f"{total_val:.2f}")
 
-        # Signatures (inside the border)
-        sig_y = B + 24
+        # --- Signatures (INSIDE the border; adjust via CHALLAN_SIG_OFFSET) ---
+        sig_y = B + CHALLAN_SIG_OFFSET
         c.setFont("Helvetica", 9)
         c.drawString(L+10, sig_y, "Receiver's Signature")
         c.drawRightString(R-10, sig_y, "Authorised Signatory")
 
-    # Copy 1
+    # copies
     T1 = page_top
     B1 = T1 - copy_h
     one_copy(T1, B1)
 
-    # Copy 2
     T2 = B1 - copy_gap
     B2 = page_bottom
     one_copy(T2, B2)
@@ -689,26 +689,27 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
     c = canvas.Canvas(buf, pagesize=A4)
     width, height = A4
     L, R, T, B = 24, width-24, height-24, 42
-
     c.setLineWidth(0.7)
 
-    # Outer page border once
+    # Outer page border
     c.rect(L, B, R-L, T-B, stroke=1, fill=0)
 
-    # Title band (light grey) with its own border
+    # Title band — FILL ONLY, then bottom separator
     band_h = 26
     c.setFillColorRGB(0.93,0.93,0.93)
-    c.rect(L+1, T-band_h-1, R-L-2, band_h, fill=1, stroke=1)
+    c.rect(L+1, T-band_h-1, R-L-2, band_h, fill=1, stroke=0)
     c.setFillColor(colors.black)
     c.setFont("Helvetica-Bold", 16)
     c.drawCentredString((L+R)/2, T-band_h+6, company["title_name"])
+    _hline(c, L, R, T-band_h-1)
 
+    # Firm strip — FILL ONLY, then top+bottom separators
     y = T-band_h-6
-
-    # Firm strip (cream) with border
     c.setFillColorRGB(*FIRM_BG_RGB)
-    c.rect(L+1, y-FIRM_BOX_H-2, R-L-2, FIRM_BOX_H, fill=1, stroke=1)
+    c.rect(L+1, y-FIRM_BOX_H-2, R-L-2, FIRM_BOX_H, fill=1, stroke=0)
     c.setFillColor(colors.black)
+    _hline(c, L, R, y-FIRM_BOX_H-2)
+    _hline(c, L, R, y-2)
 
     c.setFont("Helvetica-Bold", 12)
     c.drawString(L+10, y-14, f"TAX INVOICE - {company['title_name']}")
@@ -720,13 +721,13 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
     c.drawString(L+10, ay, f"Mobile: {company['mobile']}   |   GST No.: {company['gst']}")
     _draw_logo(c, company.get("logo"), x_right=R-12, y_top=y-4,  max_w=160, max_h=50)
 
-    # Reduced gap
+    # Gap after firm strip
     y = ay - 20
 
-    # Two info boxes using lines (full width top/bottom + center divider)
+    # Two info boxes with center divider
     part_h = 110
-    _hline(c, L+1, R-1, y)
-    _hline(c, L+1, R-1, y - part_h)
+    _hline(c, L, R, y)
+    _hline(c, L, R, y - part_h)
     _vline(c, (L+R)/2, y, y - part_h)
 
     c.setFont("Helvetica-Bold", 10)
@@ -757,7 +758,6 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
     widths = [w_ch, w_desc, w_sac, w_mtr, w_rate, w_amt]
     headers = ["Ch. No", "Product Name", "SAC", "MTR", "Rate", "Amount"]
 
-    # Header titles + underline
     x = L; c.setFont("Helvetica-Bold", 9)
     x_positions = [L]
     for w,h in zip(widths,headers):
@@ -767,14 +767,10 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
 
     data_top_y = ytbl-16
     data_h = INV_MAX_ROWS*18
-
-    # Vertical lines (skip outer edges)
     for xp in x_positions[1:-1]:
         _vline(c, xp, ytbl, ytbl - (16 + data_h))
-    # table bottom
     _hline(c, L, R, data_top_y - data_h)
 
-    # Row data (no row horizontals)
     c.setFont("Helvetica", 9)
     for r in range(INV_MAX_ROWS):
         row_y = data_top_y - (r*18) - 12
@@ -800,10 +796,10 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
     rounded = round(gross, 0)
     round_off = rounded - gross
 
-    # Subtotal band
+    # Subtotal band (lines only)
     sub_y_top = data_top_y - data_h
-    _hline(c, L+1, R-1, sub_y_top)
-    _hline(c, L+1, R-1, sub_y_top-18)
+    _hline(c, L, R, sub_y_top)
+    _hline(c, L, R, sub_y_top-18)
     split_x1 = L + (w_ch + w_desc + w_sac + w_mtr)
     split_x2 = R - w_amt
     _vline(c, split_x1, sub_y_top, sub_y_top-18)
@@ -818,7 +814,6 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
     bottom_h = 200
     left_w2 = (R-L)/2
     words_h = 110
-
     _hline(c, L, R, ybot)
     _hline(c, L, R, ybot-bottom_h)
     _vline(c, L+left_w2, ybot, ybot-bottom_h)
@@ -1305,8 +1300,8 @@ function addFromChallan(){
     if(r['Rate'] !== undefined && r['Rate'] !== null && String(r['Rate']).trim() !== ''){
       rate = String(r['Rate']);
     } else {
-      const unitMaybe = safeNum(r['Amount']);          // unit stored in Amount
-      const totalMaybe= safeNum(r['Taxable_Amount']);  // total
+      const unitMaybe = safeNum(r['Amount']);          # unit stored in Amount
+      const totalMaybe= safeNum(r['Taxable_Amount']);  # total
       if (qn > 0 && unitMaybe > 0 && Math.abs((unitMaybe * qn) - totalMaybe) < 0.01) {
         rate = unitMaybe.toFixed(2);
       } else if (qn > 0 && totalMaybe > 0) {
@@ -1586,5 +1581,3 @@ def invoice():
 # ==============================
 if __name__ == "__main__":
   app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=True)
-
-
