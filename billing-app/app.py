@@ -7,7 +7,11 @@
 # - Invoice: GST @ env GST_TOTAL (default 5%), global SAC, logs to "Invoice"
 # - Firms from "ID" tab, Suppliers from "Supplier" tab
 # - UI: Global loading overlay on form submit & navigation (no dialogs)
-# - PDF: No "double borders" (inner boxes/tables don't re-stroke the page edges)
+# - PDF:
+#     * Header + firm-info boxes have fill + borders (no overlap)
+#     * For CHALLAN, two separate outer borders (one per copy)
+#     * Signatures are inside the border
+#     * No horizontal row lines in items tables
 #
 # pip install: flask gspread google-auth reportlab gunicorn requests
 
@@ -68,7 +72,6 @@ LOGO_MAX_H   = int(os.getenv("LOGO_MAX_H", "48"))
 LOGO_TEXT_PAD= int(os.getenv("LOGO_TEXT_PAD", "20"))
 
 # ====== Firm-info strip background ======
-# Default to cream: #F5F2E6; firm area made taller and gap below reduced
 def _hex_to_rgb01(h, fallback=(245, 242, 230)):
     try:
         s = h.strip().lstrip('#')
@@ -81,7 +84,7 @@ def _hex_to_rgb01(h, fallback=(245, 242, 230)):
         return (r/255.0, g/255.0, b/255.0)
 
 FIRM_BG_HEX = os.getenv("FIRM_BG_HEX", "#F5F2E6")
-FIRM_BOX_H  = int(os.getenv("FIRM_BOX_H", "72"))  # was 54 → more vertical space
+FIRM_BOX_H  = int(os.getenv("FIRM_BOX_H", "72"))  # taller firm area by default
 FIRM_BG_RGB = _hex_to_rgb01(FIRM_BG_HEX)
 
 # Optional overrides for logos (by UPPERCASE firm name)
@@ -537,67 +540,71 @@ def _save_copy(kind, firm_name, filename, data_bytes):
         print("Skip saving copy:", e)
 
 # ==============================
-# DRAW HELPERS (no double borders)
+# DRAW HELPERS
 # ==============================
 def _hline(c, x1, x2, y): c.line(x1, y, x2, y)
 def _vline(c, x, y1, y2): c.line(x, y1, x, y2)
 
-# --------- Draw Challan (two copies) ---------
+# --------- Draw Challan (two copies; each with its own border) ---------
 def draw_challan_pdf(buf, company, party, meta, items):
     c = canvas.Canvas(buf, pagesize=A4)
     width, height = A4
+    L, R = 24, width-24
+    page_top = height - 24
+    page_bottom = 42
+    copy_gap = 16
+    copy_h = (page_top - page_bottom - copy_gap) / 2
 
-    def one_copy(top_y):
-        L, R = 24, width-24
-        T = top_y
-
-        # Title band (no stroke to avoid double)
+    def one_copy(T, B):
+        # Outer border for this copy
         c.setLineWidth(0.7)
+        c.rect(L, B, R-L, T-B, stroke=1, fill=0)
+
+        # Title band (light grey) with bottom border
+        title_h = 22
         c.setFillColorRGB(0.93,0.93,0.93)
-        c.rect(L, T-22, R-L, 22, fill=1, stroke=0)
+        c.rect(L+1, T-title_h-1, R-L-2, title_h, fill=1, stroke=1)  # inset 1pt to avoid outer overlap
         c.setFillColor(colors.black)
         c.setFont("Helvetica-Bold", 14)
-        c.drawCentredString((L+R)/2, T-22+5, company["title_name"])
+        c.drawCentredString((L+R)/2, T-title_h+5, company["title_name"])
 
-        y = T-22-6
-
-        # Firm strip (no stroke) + content
+        # Firm info box (cream) with its own border + reduced gap after
+        y = T - title_h - 6
         c.setFillColorRGB(*FIRM_BG_RGB)
-        c.rect(L, y-FIRM_BOX_H, R-L, FIRM_BOX_H, fill=1, stroke=0)
+        c.rect(L+1, y-FIRM_BOX_H-2, R-L-2, FIRM_BOX_H, fill=1, stroke=1)
         c.setFillColor(colors.black)
 
         c.setFont("Helvetica-Bold", 11)
-        c.drawString(L+8, y-14, f"DELIVERY CHALLAN - {company['title_name']}")
+        c.drawString(L+10, y-14, f"DELIVERY CHALLAN - {company['title_name']}")
         c.setFont("Helvetica", 9)
-        inner_w = (R-L) - 16
+        inner_w = (R-L-2) - 20
         ay = y - 30
         for ln in _wrap(f"Address: {company['addr']}", inner_w - (LOGO_MAX_W + LOGO_TEXT_PAD)):
-            c.drawString(L+8, ay, ln); ay -= 12
-        c.drawString(L+8, ay, f"Mobile: {company['mobile']}   |   GST No.: {company['gst']}")
-        _draw_logo(c, company.get("logo"), x_right=R-10, y_top=y-2, max_w=LOGO_MAX_W, max_h=LOGO_MAX_H)
+            c.drawString(L+10, ay, ln); ay -= 12
+        c.drawString(L+10, ay, f"Mobile: {company['mobile']}   |   GST No.: {company['gst']}")
+        _draw_logo(c, company.get("logo"), x_right=R-12, y_top=y-4, max_w=LOGO_MAX_W, max_h=LOGO_MAX_H)
 
-        # Reduced gap beneath firm box
-        y = ay - 12   # was -24
+        # Gap after firm box (smaller)
+        y = ay - 10
 
-        # Two info boxes using lines (no side strokes => no double with page edges)
+        # Info area (two columns) – draw as one box with center divider
         part_h = 112
-        left_w = (R - L) / 2
-        _hline(c, L, R, y)                 # top line
-        _hline(c, L, R, y - part_h)        # bottom line
-        _vline(c, L + left_w, y, y - part_h)  # center split
+        _hline(c, L+1, R-1, y)                 # top
+        _hline(c, L+1, R-1, y - part_h)        # bottom
+        _vline(c, (L+R)/2, y, y - part_h)      # center
 
         c.setFont("Helvetica-Bold", 10)
-        c.drawString(L+8, y-16, f"Party Details - {party.get('name') or '—'}")
+        c.drawString(L+10, y-16, f"Party Details - {party.get('name') or '—'}")
         c.setFont("Helvetica", 9)
         vals = " | ".join([v for v in [party.get('gstin'), party.get('mobile')] if v])
-        if vals: c.drawString(L+8, y-32, vals)
+        if vals: c.drawString(L+10, y-32, vals)
         label = "Address: "; lw = pdfmetrics.stringWidth(label, "Helvetica", 9)
-        addr = _wrap((party.get('address') or ""), left_w-16 - lw)[:2]
-        c.drawString(L+8, y-46, label + (addr[0] if addr else ""))
+        addr = _wrap((party.get('address') or ""), ((R-L)/2)-20 - lw)[:2]
+        c.drawString(L+10, y-46, label + (addr[0] if addr else ""))
         if len(addr) > 1:
-            c.drawString(L+8 + lw, y-58, addr[1])
+            c.drawString(L+10 + lw, y-58, addr[1])
 
-        mx = L+left_w+10
+        mx = (L+R)/2 + 10
         c.setFont("Helvetica-Bold", 10); c.drawString(mx, y-16, "Challan Details")
         c.setFont("Helvetica", 9)
         c.drawString(mx, y-34, f"Challan No.: {meta['no']}")
@@ -608,36 +615,33 @@ def draw_challan_pdf(buf, company, party, meta, items):
         else:
             c.drawString(mx, y-50, f"Date: {meta['date']}")
 
+        # Items table (no horizontal row lines)
         ytbl = y - part_h - 12
         table_w = (R-L)
         w_no, w_mtr, w_rate, w_amt = 40, 70, 90, 90
         w_desc = table_w - (w_no + w_mtr + w_rate + w_amt)
         widths  = [w_no, w_desc, w_mtr, w_rate, w_amt]
         headers = ["No.", "Product Name", "MTR", "Rate", "Amount"]
-        total_h = 16 + CH_MAX_ROWS*18
 
-        # Header text
-        x = L; c.setFont("Helvetica-Bold", 9)
+        # Header row + bottom grid line
+        c.setFont("Helvetica-Bold", 9)
+        x = L
         x_positions = [L]
         for w,h in zip(widths,headers):
             c.drawString(x+6, ytbl-12, h)
             x += w; x_positions.append(x)
+        # header underline
+        _hline(c, L, R, ytbl-16)
 
-        # Grid lines (no left/right border strokes)
+        # vertical column lines (no left/right extra strokes)
         data_top_y = ytbl-16
         data_h = CH_MAX_ROWS*18
-
-        # Header bottom line
-        _hline(c, L, R, ytbl-16)
-        # Row lines
-        for r in range(1, CH_MAX_ROWS+1):
-            _hline(c, L, R, data_top_y - r*18)
-
-        # Vertical column lines (skip first/last to avoid double with page edges)
         for xp in x_positions[1:-1]:
             _vline(c, xp, ytbl, ytbl - (16 + data_h))
+        # table bottom
+        _hline(c, L, R, data_top_y - data_h)
 
-        # Row data
+        # Row data (no internal horizontal lines)
         c.setFont("Helvetica", 9)
         for r in range(CH_MAX_ROWS):
             row_y = data_top_y - (r*18) - 12
@@ -654,38 +658,30 @@ def draw_challan_pdf(buf, company, party, meta, items):
 
         # Grand total band (lines only)
         sub_y_top = data_top_y - data_h
-        _hline(c, L, R, sub_y_top)         # top
-        _hline(c, L, R, sub_y_top-18)      # bottom
+        _hline(c, L+1, R-1, sub_y_top)         # top
+        _hline(c, L+1, R-1, sub_y_top-18)      # bottom
         _vline(c, L + (table_w - w_amt), sub_y_top, sub_y_top-18)
         c.setFont("Helvetica-Bold", 9)
         c.drawString(L+7, sub_y_top-12, "Grand Total (₹)")
         total_val = sum(float(a) for *_, a in items)
         c.drawRightString(R-6, sub_y_top-12, f"{total_val:.2f}")
 
-        # Signatures
-        sig_top = sub_y_top - 26
+        # Signatures (inside the border)
+        sig_y = B + 24
         c.setFont("Helvetica", 9)
-        c.drawString(L+10, sig_top-30, "Receiver's Signature")
-        c.drawRightString(R-10, sig_top-30, "Authorised Signatory")
+        c.drawString(L+10, sig_y, "Receiver's Signature")
+        c.drawRightString(R-10, sig_y, "Authorised Signatory")
 
-        # Outer page border — draw at the end for crisp edges
-        c.rect(L, T - (T - (sig_top - 36)) - (T - (sig_top - 36)), R-L, T - (sig_top - 36), stroke=0, fill=0)  # noop to keep compat
-
-        # Enclose the whole copy area
-        c.rect(L, T - (T - (sig_top - 36)) - (T - (sig_top - 36)), 0, 0, stroke=0, fill=0)  # noop
-
-        # Draw outer border for this copy
-        c.rect(L, T - (T - (sig_top - 36)) - 0, R-L, T - (sig_top - 36) - (T - height/2 if top_y < height-24 else 0), stroke=0, fill=0)
-
-    # Outer page border for whole sheet copies
-    c.setLineWidth(0.7)
     # Copy 1
-    one_copy(height-24)
-    # Copy 2
-    one_copy((height/2)-8)
+    T1 = page_top
+    B1 = T1 - copy_h
+    one_copy(T1, B1)
 
-    # Final outer page border (single stroke) across the whole page
-    c.rect(24, 42, (A4[0]-48), (A4[1]-84), stroke=1, fill=0)
+    # Copy 2
+    T2 = B1 - copy_gap
+    B2 = page_bottom
+    one_copy(T2, B2)
+
     c.save()
 
 # --------- Draw Invoice (single copy) ---------
@@ -699,40 +695,39 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
     # Outer page border once
     c.rect(L, B, R-L, T-B, stroke=1, fill=0)
 
-    # Title band (no stroke, avoids double on top)
+    # Title band (light grey) with its own border
     band_h = 26
     c.setFillColorRGB(0.93,0.93,0.93)
-    c.rect(L, T-band_h, R-L, band_h, fill=1, stroke=0)
+    c.rect(L+1, T-band_h-1, R-L-2, band_h, fill=1, stroke=1)
     c.setFillColor(colors.black)
     c.setFont("Helvetica-Bold", 16)
     c.drawCentredString((L+R)/2, T-band_h+6, company["title_name"])
 
-    y = T-band_h-8
+    y = T-band_h-6
 
-    # Firm strip (no stroke) + content
+    # Firm strip (cream) with border
     c.setFillColorRGB(*FIRM_BG_RGB)
-    c.rect(L, y-FIRM_BOX_H, R-L, FIRM_BOX_H, fill=1, stroke=0)
+    c.rect(L+1, y-FIRM_BOX_H-2, R-L-2, FIRM_BOX_H, fill=1, stroke=1)
     c.setFillColor(colors.black)
 
     c.setFont("Helvetica-Bold", 12)
-    c.drawString(L+10, y-16, f"TAX INVOICE - {company['title_name']}")
+    c.drawString(L+10, y-14, f"TAX INVOICE - {company['title_name']}")
     c.setFont("Helvetica", 9)
-    inner_w = (R - L) - 20
+    inner_w = (R - L - 2) - 20
     ay = y - 30
     for ln in _wrap(f"Address: {company['addr']}", inner_w - (LOGO_MAX_W + LOGO_TEXT_PAD)):
         c.drawString(L+10, ay, ln); ay -= 12
     c.drawString(L+10, ay, f"Mobile: {company['mobile']}   |   GST No.: {company['gst']}")
-    _draw_logo(c, company.get("logo"), x_right=R-10, y_top=y-2,  max_w=160, max_h=50)
+    _draw_logo(c, company.get("logo"), x_right=R-12, y_top=y-4,  max_w=160, max_h=50)
 
     # Reduced gap
-    y = ay - 12   # was -24
+    y = ay - 10
 
-    # Two info boxes using lines (no side strokes)
+    # Two info boxes using lines (full width top/bottom + center divider)
     part_h = 130
-    left_w = (R - L) / 2
-    _hline(c, L, R, y)
-    _hline(c, L, R, y - part_h)
-    _vline(c, L + left_w, y, y - part_h)
+    _hline(c, L+1, R-1, y)
+    _hline(c, L+1, R-1, y - part_h)
+    _vline(c, (L+R)/2, y, y - part_h)
 
     c.setFont("Helvetica-Bold", 10)
     c.drawString(L+8, y-18, "Supplier details")
@@ -745,16 +740,16 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
     ]:
         c.drawString(sx, sy, ln); sy -= 12
     c.drawString(sx, sy, "Address:"); sy -= 12
-    for ln in _wrap(supplier.get('address',''), left_w-16)[:8]:
+    for ln in _wrap(supplier.get('address',''), (R-L)/2-16)[:8]:
         c.drawString(sx+12, sy, ln); sy -= 12
 
-    mx = L+left_w+10
+    mx = (L+R)/2 + 10
     c.setFont("Helvetica-Bold", 10); c.drawString(mx, y-18, "Invoice Details")
     c.setFont("Helvetica", 9)
     c.drawString(mx,     y-36, f"Invoice No.: {inv_meta['no']}")
     c.drawString(mx,     y-52, f"Date: {inv_meta['date']}")
 
-    # Items table (grid lines, no side strokes)
+    # Items table (no horizontal row lines)
     ytbl = y-part_h-12
     table_w = (R-L)
     w_ch, w_desc, w_sac, w_mtr, w_rate = 65, 240, 70, 60, 60
@@ -762,28 +757,24 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
     widths = [w_ch, w_desc, w_sac, w_mtr, w_rate, w_amt]
     headers = ["Ch. No", "Product Name", "SAC", "MTR", "Rate", "Amount"]
 
-    total_h = 16 + INV_MAX_ROWS*18
-
-    # Header text
+    # Header titles + underline
     x = L; c.setFont("Helvetica-Bold", 9)
     x_positions = [L]
     for w,h in zip(widths,headers):
         c.drawString(x+6, ytbl-12, h)
         x += w; x_positions.append(x)
+    _hline(c, L, R, ytbl-16)
 
     data_top_y = ytbl-16
     data_h = INV_MAX_ROWS*18
 
-    # Header bottom line
-    _hline(c, L, R, ytbl-16)
-    # Row lines
-    for r in range(1, INV_MAX_ROWS+1):
-        _hline(c, L, R, data_top_y - r*18)
-    # Vertical lines (skip left/right)
+    # Vertical lines (skip outer edges)
     for xp in x_positions[1:-1]:
         _vline(c, xp, ytbl, ytbl - (16 + data_h))
+    # table bottom
+    _hline(c, L, R, data_top_y - data_h)
 
-    # Row data
+    # Row data (no row horizontals)
     c.setFont("Helvetica", 9)
     for r in range(INV_MAX_ROWS):
         row_y = data_top_y - (r*18) - 12
@@ -809,33 +800,30 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
     rounded = round(gross, 0)
     round_off = rounded - gross
 
-    # Subtotal band (lines only)
+    # Subtotal band
     sub_y_top = data_top_y - data_h
-    _hline(c, L, R, sub_y_top)         # top
-    _hline(c, L, R, sub_y_top-18)      # bottom
-    # vertical split after first 4 columns
-    split_x = L + (w_ch + w_desc + w_sac + w_mtr)
-    _vline(c, split_x, sub_y_top, sub_y_top-18)
-    # Amount column split line
-    _vline(c, R - w_amt, sub_y_top, sub_y_top-18)
+    _hline(c, L+1, R-1, sub_y_top)
+    _hline(c, L+1, R-1, sub_y_top-18)
+    split_x1 = L + (w_ch + w_desc + w_sac + w_mtr)
+    split_x2 = R - w_amt
+    _vline(c, split_x1, sub_y_top, sub_y_top-18)
+    _vline(c, split_x2, sub_y_top, sub_y_top-18)
 
     c.setFont("Helvetica-Bold", 9)
     c.drawString(L+7, sub_y_top-12, "Sub Total")
     c.drawRightString(R-6, sub_y_top-12, f"{sub_total:.2f}")
 
-    # Bottom sections (lines only; left/right page edges untouched)
+    # Bottom sections (top/bottom + vertical middle)
     ybot = sub_y_top - 26
     bottom_h = 200
     left_w2 = (R-L)/2
     words_h = 110
 
-    # Top & bottom borders
-    _hline(c, L, R, ybot)                  # top
-    _hline(c, L, R, ybot-bottom_h)         # bottom
-    # Vertical middle divider
+    _hline(c, L, R, ybot)
+    _hline(c, L, R, ybot-bottom_h)
     _vline(c, L+left_w2, ybot, ybot-bottom_h)
-    # Words box (left, top part)
     _hline(c, L, L+left_w2, ybot-words_h)
+
     c.setFont("Helvetica-Bold", 10); c.drawString(L+8, ybot-16, "Amounts in Words:")
     c.setFont("Helvetica", 9)
     xw = L+8; yline = ybot-32
@@ -845,14 +833,12 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
         for wln in _wrap(f"{label}: {text}", left_w2-16):
             c.drawString(xw, yline, wln); yline -= 12
 
-    # Bank details (left bottom)
     c.setFont("Helvetica-Bold", 10); c.drawString(L+8, ybot-words_h-16, "Bank Details:")
     c.setFont("Helvetica", 9)
     by = ybot-words_h-32
     for line in company.get("bank_lines", []):
         c.drawString(L+8, by, line); by -= 12
 
-    # Summary (right side)
     rx = L+left_w2+10; rv = R-8
     c.setFont("Helvetica-Bold", 10); c.drawString(rx, ybot-16, "Summary")
     c.setFont("Helvetica-Bold", 9)
@@ -869,7 +855,7 @@ def draw_invoice_pdf(buf, company, supplier, inv_meta, items, discount):
     c.drawString(rx, yy-2, "Grand Total (₹)")
     c.drawRightString(rv, yy-2, f"{int(round(rounded))}")
 
-    # Signatures (no extra boxes)
+    # Signatures (inside border)
     c.setFont("Helvetica", 9)
     c.drawString(L+10, B+22, "Customer Signature")
     c.drawRightString(R-10, B+22, f"For {company['company_name']}")
