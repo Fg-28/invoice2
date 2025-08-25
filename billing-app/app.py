@@ -1300,8 +1300,8 @@ function addFromChallan(){
     if(r['Rate'] !== undefined && r['Rate'] !== null && String(r['Rate']).trim() !== ''){
       rate = String(r['Rate']);
     } else {
-      const unitMaybe = safeNum(r['Amount']);          # unit stored in Amount
-      const totalMaybe= safeNum(r['Taxable_Amount']);  # total
+      const unitMaybe = safeNum(r['Amount']);         
+      const totalMaybe= safeNum(r['Taxable_Amount']);  
       if (qn > 0 && unitMaybe > 0 && Math.abs((unitMaybe * qn) - totalMaybe) < 0.01) {
         rate = unitMaybe.toFixed(2);
       } else if (qn > 0 && totalMaybe > 0) {
@@ -1581,3 +1581,4 @@ def invoice():
 # ==============================
 if __name__ == "__main__":
   app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=True)
+
